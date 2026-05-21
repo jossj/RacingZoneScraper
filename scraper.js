@@ -500,17 +500,22 @@ async function screenshotAndOcr(page, horseName, screenshotDir) {
 }
 
 function parseRaceRow(line) {
-  // Accept dd/mm/yy, dd-mm-yy, dd.mm.yy  OR  "15 May 25" / "15 May 2025"
+  // Accept dd/mm/yy, dd-mm-yy, dd.mm.yy
+  //        "15 May 25" / "15 May 2025" (day-first)
+  //        "May-9 25"  / "May-9 2025"  (month-first, as used on RacingZone)
   const dateMatch =
     line.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/) ||
-    line.match(/\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]+\d{2,4})\b/i);
+    line.match(/\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]+\d{2,4})\b/i) ||
+    line.match(/\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{1,2}[\s,]+\d{2,4})\b/i);
   if (!dateMatch) return null;
 
   const row = { date: dateMatch[1], raw: line };
 
-  // Distance: 800m – 3200m
-  const dist = line.match(/\b(\d{3,4}m)\b/i);
-  if (dist) row.distance = dist[1];
+  // Distance: 800m – 3600m — accept "1800m" or bare "1800"
+  const distM   = line.match(/\b(\d{3,4}m)\b/i);
+  const distNum = !distM && line.match(/\b([6-9]\d{2}|[12]\d{3}|3[0-6]\d{2})\b/);
+  if      (distM)   row.distance = distM[1];
+  else if (distNum) row.distance = distNum[1] + 'm';
 
   // Track condition: Good4, Soft7, Heavy10, Firm, Synthetic
   const cond = line.match(/\b(Firm\d*|Good\d*|Soft\d*|Heavy\d*|Synthetic|Syn)\b/i);
