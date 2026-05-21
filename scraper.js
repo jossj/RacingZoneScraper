@@ -21,15 +21,14 @@ function parseArgs(argv) {
   const opts = {
     output: DEFAULT_OUTPUT,
     browser: 'chromium',
-    headless: true,
+    headless: false,   // always show the browser window
     delayMs: DEFAULT_DELAY_MS,
   };
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
-      case '--output':   opts.output   = argv[++i]; break;
-      case '--browser':  opts.browser  = argv[++i]; break;
-      case '--no-headless': opts.headless = false;  break;
-      case '--delay':    opts.delayMs  = Number(argv[++i]) * 1000; break;
+      case '--output':  opts.output  = argv[++i]; break;
+      case '--browser': opts.browser = argv[++i]; break;
+      case '--delay':   opts.delayMs = Number(argv[++i]) * 1000; break;
     }
   }
   return opts;
@@ -141,10 +140,45 @@ async function sleep(ms) {
 // TAB scraper
 // ---------------------------------------------------------------------------
 
+async function clickShowAllForm(page) {
+  // Button text variations seen on TAB
+  const candidates = [
+    'button:has-text("Show All Form")',
+    'button:has-text("Show all form")',
+    'button:has-text("Show All Forms")',
+    'a:has-text("Show All Form")',
+    '[class*="show-all-form" i]',
+    '[class*="showAllForm" i]',
+    '[data-testid*="show-all-form" i]',
+  ];
+
+  for (const sel of candidates) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.count({ timeout: 3000 }) > 0) {
+        info('Found "Show All Form" button — clicking...');
+        await btn.scrollIntoViewIfNeeded();
+        await btn.click();
+        // Wait for the expanded form content to render
+        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+        await sleep(2000);
+        info('"Show All Form" clicked and page settled');
+        return true;
+      }
+    } catch { /* try next candidate */ }
+  }
+
+  warn('"Show All Form" button not found — scraping page as-is');
+  return false;
+}
+
 async function scrapeTabPage(page, url) {
   info('Navigating to TAB page:', url);
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(3000);
+
+  // Expand full form data before scraping
+  await clickShowAllForm(page);
 
   const race = {
     venue: '', raceNumber: '', raceName: '', date: '', time: '',
