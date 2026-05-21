@@ -626,6 +626,19 @@ function parseRaceRow(line) {
   const notOdds = weightMatch.filter(w => row.odds !== w);
   if (notOdds.length) row.weight = notOdds[0];
 
+  // Race timing — RacingZone shows times as decimal seconds (e.g. 97.96, 37.81).
+  // Both are XX.XX or XXX.XX with exactly two decimal places.
+  // Exclude any match preceded by '$' (those are prices, not times).
+  // Total race time > 55 s; last-600m split is 30–55 s.
+  const timingNums = [...line.matchAll(/\b(\d{2,3}\.\d{2})\b/g)]
+    .filter(m => line[m.index - 1] !== '$')
+    .map(m => ({ raw: m[1], val: parseFloat(m[1]) }))
+    .filter(t => t.val >= 30);
+  const totalTimeEntry = timingNums.find(t => t.val > 55);
+  const last600Entry   = timingNums.find(t => t.val >= 30 && t.val <= 55);
+  if (totalTimeEntry) row.totalTime = totalTimeEntry.raw;
+  if (last600Entry)   row.last600   = last600Entry.raw;
+
   return row;
 }
 
@@ -990,7 +1003,7 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
   ws7.views = [{ state: 'frozen', ySplit: 1, xSplit: 1 }];
   const rzHistCols = [
     'Horse', 'Date', 'Placing', 'Venue', 'Barrier', 'Distance', 'Race Name',
-    'Prize', 'Jockey', 'Weight', 'Condition', 'Class', 'Odds', 'Time',
+    'Prize', 'Jockey', 'Weight', 'Total Time', '600m Split', 'Condition', 'Class', 'Odds', 'Time',
     'Margin', 'In-Run', 'Chg', 'Raw Line',
   ];
   styleHeader(ws7.addRow(rzHistCols), rzHistCols.length);
@@ -1014,6 +1027,8 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
         entry.prize        || '',
         entry.jockey       || '',
         entry.weight       || '',
+        entry.totalTime    || '',
+        entry.last600      || '',
         entry.condition    || '',
         entry.class        || '',
         entry.odds         || '',
