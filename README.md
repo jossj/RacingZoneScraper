@@ -5,20 +5,21 @@ career statistics, and saves everything to an Excel workbook.
 
 ## Requirements
 
-- Python 3.9+
-- Google Chrome **or** Firefox installed on your machine
+- Node.js 18+
+- Google Chrome (Chromium) or Firefox installed
 - Internet access
 
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+npm install
+npm run install-browsers
 ```
 
 ## Usage
 
-```
-python scraper.py [options]
+```bash
+node scraper.js
 ```
 
 When you run the script it will prompt you to paste the TAB race URL:
@@ -37,23 +38,22 @@ TAB race URL: <paste here>
 
 | Option | Default | Description |
 |---|---|---|
-| `--output` | `C:\tab\scrape` | Directory to save the Excel file |
-| `--browser` | `chrome` | `chrome` or `firefox` |
-| `--headless` | on | Run browser invisibly (default) |
+| `--output <path>` | `C:\tab\scrape` | Directory to save the Excel file |
+| `--browser <name>` | `chromium` | `chromium` or `firefox` |
 | `--no-headless` | — | Show the browser window (useful for debugging) |
-| `--delay` | `2.0` | Seconds to wait between RacingZone requests |
+| `--delay <seconds>` | `2` | Seconds to wait between RacingZone requests |
 
 ### Examples
 
 ```bash
 # Run and enter the URL when prompted
-python scraper.py
+node scraper.js
 
 # Show browser window (good for debugging)
-python scraper.py --no-headless
+node scraper.js --no-headless
 
 # Use Firefox and a custom output folder
-python scraper.py --browser firefox --output "D:\racing"
+node scraper.js --browser firefox --output "D:\racing"
 ```
 
 ## Output
@@ -69,12 +69,7 @@ An `.xlsx` file is created in the output folder containing four sheets:
 
 ## Notes
 
-- The scraper uses `webdriver-manager` to automatically download the correct
-  ChromeDriver or GeckoDriver — no manual driver installation needed.
-- If TAB changes its page layout the CSS selectors in `scrape_tab_page()` /
-  `_scrape_tab_runners()` may need updating. Run with `--no-headless` to
-  inspect the page visually.
-- A 2-second polite delay is applied between each RacingZone request to avoid
-  overloading the server. Adjust with `--delay`.
-- On Linux/Mac the Windows path `C:\tab\scrape` is automatically mapped to
-  `~/tab/scrape`.
+- Playwright automatically manages the browser binary — no manual driver download needed.
+- Run with `--no-headless` to watch the browser work or to debug selector issues.
+- A 2-second polite delay is applied between each RacingZone request. Adjust with `--delay`.
+- On Linux/Mac the Windows path `C:\tab\scrape` is automatically mapped to `~/tab/scrape`.

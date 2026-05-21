@@ -1,0 +1,14 @@
+{
+  "name": "racing-zone-scraper",
+  "version": "1.0.0",
+  "description": "Scrapes TAB race pages and RacingZone horse statistics into Excel",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "playwright": "^1.44.0"
+  }
+}
