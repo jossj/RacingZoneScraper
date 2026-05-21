@@ -8,8 +8,6 @@
   },
   "dependencies": {
     "exceljs": "^4.4.0",
-    "puppeteer": "^25.0.4",
-    "sharp": "^0.33.0",
-    "tesseract.js": "^7.0.0"
+    "puppeteer": "^25.0.4"
   }
 }

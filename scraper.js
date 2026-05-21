@@ -6,8 +6,6 @@ const readline           = require('readline');
 const path               = require('path');
 const fs                 = require('fs');
 const os                 = require('os');
-const { createWorker, PSM, OEM } = require('tesseract.js');
-const sharp              = require('sharp');
 
 const RACINGZONE_HORSES_URL = 'https://www.racingzone.com.au/horses/';
 const DEFAULT_OUTPUT        = 'C:\\tab\\scrape';
@@ -351,7 +349,7 @@ async function fillInput(page, selector, value) {
   }, selector, value);
 }
 
-async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
+async function scrapeRacingZoneHorse(page, horseName) {
   const stats = {
     name: horseName, error: '',
     careerStarts: '', careerWins: '', careerSeconds: '', careerThirds: '',
@@ -473,9 +471,21 @@ async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
     });
     await sleep(1500);
 
-    info(`  Taking screenshot and running OCR: ${page.url()}`);
-    const ocrText = await screenshotAndOcr(page, horseName, screenshotDir);
-    parseOcrText(ocrText, stats);
+    // Read visible page text directly from the DOM — no screenshot, no OCR,
+    // no character errors. innerText returns text in visual reading order,
+    // matching the structure the text parser expects.
+    info(`  Extracting data from DOM: ${page.url()}`);
+    const pageText = await page.evaluate(() => document.body.innerText || document.body.textContent || '');
+    info(`  Page text: ${pageText.length} chars`);
+    parsePageText(pageText, stats);
+
+    // Overlay with structured table extraction for race history — direct DOM
+    // column mapping is more accurate than regex parsing on running text.
+    const domRows = await extractRaceHistoryDom(page);
+    if (domRows.length > 0) {
+      stats.raceHistory = domRows;
+      info(`  DOM table: ${domRows.length} race history rows`);
+    }
 
   } catch (err) {
     error(`RacingZone error for ${horseName}:`, err.message);
@@ -485,55 +495,8 @@ async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
 }
 
 // ---------------------------------------------------------------------------
-// Screenshot → OCR → parse  (replaces DOM scraping for RacingZone)
+// DOM extraction helpers for RacingZone
 // ---------------------------------------------------------------------------
-
-async function screenshotAndOcr(page, horseName, screenshotDir) {
-  fs.mkdirSync(screenshotDir, { recursive: true });
-  const safeName = horseName.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 50);
-  const imgPath  = path.join(screenshotDir, `${safeName}.png`);
-  const procPath = path.join(screenshotDir, `${safeName}_ocr.png`);
-
-  // Scroll to top so the full page starts from the beginning
-  await page.evaluate(() => window.scrollTo(0, 0));
-  await sleep(500);
-
-  await page.screenshot({ path: imgPath, fullPage: true });
-  info(`  Screenshot saved: ${imgPath}`);
-
-  // Preprocess for better OCR accuracy:
-  //   • 2× upscale — Tesseract is calibrated for ~300 DPI; browser screenshots are ~96 DPI
-  //   • greyscale  — eliminates colour noise that confuses character recognition
-  //   • normalise  — stretches histogram to full range, improving low-contrast sections
-  //   • sharpen    — crispens text edges blurred by the browser's sub-pixel rendering
-  const { width } = await sharp(imgPath).metadata();
-  await sharp(imgPath)
-    .resize({ width: width * 2, kernel: sharp.kernel.lanczos3 })
-    .greyscale()
-    .normalise()
-    .sharpen({ sigma: 1 })
-    .toFile(procPath);
-  info(`  OCR image preprocessed: ${width}px → ${width * 2}px wide`);
-
-  // LSTM_ONLY (OEM 1) is Tesseract's neural-net engine — more accurate than the
-  // legacy character classifier, especially on varied fonts and tabular layouts.
-  const worker = await createWorker('eng', OEM.LSTM_ONLY);
-  try {
-    await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
-    const { data: { text } } = await worker.recognize(procPath);
-    info(`  OCR complete: ${text.length} chars extracted`);
-
-    // Save raw OCR text next to the screenshot — inspect this file if fields
-    // are missing, since it shows exactly what Tesseract read from the page.
-    const txtPath = path.join(screenshotDir, `${safeName}_ocr.txt`);
-    fs.writeFileSync(txtPath, text, 'utf8');
-    info(`  OCR text saved: ${txtPath}`);
-
-    return text;
-  } finally {
-    await worker.terminate();
-  }
-}
 
 function parseRaceRow(line) {
   // Accept dd/mm/yy, dd-mm-yy, dd.mm.yy  OR  "15 May 25" / "15 May 2025"
@@ -591,11 +554,17 @@ const HISTORY_HEADINGS = [
   'performance history', 'starts history', 'form record', 'runs',
 ];
 
-function parseOcrText(rawText, stats) {
+// Label keywords whose value sits on the very next line in definition-list style.
+const ADJACENT_LABELS = {
+  sire: 'sire', dam: 'dam', colour: 'colour', color: 'colour',
+  sex: 'sex', gender: 'sex', age: 'age', trainer: 'trainer',
+  owner: 'owner', breeder: 'breeder', country: 'country', origin: 'country',
+};
+
+function parsePageText(rawText, stats) {
   const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
 
-  // Log first 300 chars of OCR to help diagnose heading / format issues
-  info(`  OCR preview: ${rawText.slice(0, 300).replace(/\n/g, ' ↵ ')}`);
+  info(`  Page text preview: ${rawText.slice(0, 300).replace(/\n/g, ' ↵ ')}`);
 
   // Phase 1 — scan every line for profile fields, career stats, section headings
   let currentSection = null;
@@ -723,7 +692,129 @@ function parseOcrText(rawText, stats) {
       info(`  Fallback scan found ${stats.raceHistory.length} race rows`);
   }
 
+  // Phase 2 — adjacent-line key/value (definition-list style: label on one
+  // line, value on the next, no colon separator between them).
+  for (let i = 0; i < lines.length - 1; i++) {
+    const key = lines[i].toLowerCase().replace(/:$/, '').trim();
+    const field = ADJACENT_LABELS[key];
+    if (field && !stats[field]) stats[field] = lines[i + 1];
+  }
+
   info(`  Parsed — career: ${stats.careerStarts}/${stats.careerWins}/${stats.careerSeconds}/${stats.careerThirds} | sire: ${stats.sire || '–'} | history rows: ${stats.raceHistory.length}`);
+}
+
+// ---------------------------------------------------------------------------
+// Structured race-history extraction from the live DOM
+// ---------------------------------------------------------------------------
+
+async function extractRaceHistoryDom(page) {
+  return page.evaluate(() => {
+    const txt    = el => (el ? el.textContent.trim() : '');
+    const low    = s  => s.toLowerCase();
+    const dateRe = /\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b|\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i;
+
+    // ── Strategy 1: HTML <table> whose cells contain race dates ──────────────
+    const histTable = [...document.querySelectorAll('table')].find(t =>
+      [...t.querySelectorAll('td')].some(td => dateRe.test(td.textContent))
+    );
+
+    if (histTable) {
+      // Map <thead> columns to known field names
+      const headers = [...histTable.querySelectorAll('thead th, thead td, tr:first-child th')]
+        .map(h => low(txt(h)));
+
+      const col = (...keys) => {
+        const i = headers.findIndex(h => keys.some(k => h.includes(k)));
+        return i !== -1 ? i : -1;
+      };
+
+      const cDate    = col('date');
+      const cPlace   = col('pos', 'plac', 'finish', 'place');
+      const cVenue   = col('venue', 'track', 'course');
+      const cClass   = col('class', 'grade');
+      const cDist    = col('dist', 'distance');
+      const cWeight  = col('weight', 'wgt', 'kg');
+      const cBarrier = col('barrier', 'gate');
+      const cOdds    = col('odds', 'sp', 'price');
+      const cWinner  = col('winner', '1st', 'first');
+      const cMargin  = col('margin', 'len');
+      const cTime    = col('time');
+      const cInRun   = col('in run', 'inrun', 'sect');
+
+      const rows = [];
+      histTable.querySelectorAll('tbody tr, tr').forEach(tr => {
+        const cells = [...tr.querySelectorAll('td')].map(txt);
+        if (!cells.length) return;
+
+        const dateIdx = cDate !== -1 ? cDate : cells.findIndex(c => dateRe.test(c));
+        if (dateIdx === -1) return;
+
+        rows.push({
+          date:      cells[dateIdx]                  || '',
+          placing:   cPlace   !== -1 ? cells[cPlace]   : '',
+          venue:     cVenue   !== -1 ? cells[cVenue]   : '',
+          class:     cClass   !== -1 ? cells[cClass]   : '',
+          distance:  cDist    !== -1 ? cells[cDist]    : '',
+          weight:    cWeight  !== -1 ? cells[cWeight]  : '',
+          barrier:   cBarrier !== -1 ? cells[cBarrier] : '',
+          odds:      cOdds    !== -1 ? cells[cOdds]    : '',
+          winner2nd: cWinner  !== -1 ? cells[cWinner]  : '',
+          margin:    cMargin  !== -1 ? cells[cMargin]  : '',
+          time:      cTime    !== -1 ? cells[cTime]    : '',
+          inRun:     cInRun   !== -1 ? cells[cInRun]   : '',
+        });
+      });
+      if (rows.length) return rows;
+    }
+
+    // ── Strategy 2: div/React row layout ─────────────────────────────────────
+    // Find a container whose heading suggests race history, then read child rows.
+    const histKws = [
+      'race history', 'racing history', 'past runs', 'run history', 'recent runs',
+      'last starts', 'race record', 'past performances', 'form history', 'runs',
+    ];
+    const allHeadings = [...document.querySelectorAll(
+      'h1,h2,h3,h4,h5,h6,[class*="heading"],[class*="section-title"],[class*="tab-title"]'
+    )];
+    let histContainer = null;
+    for (const h of allHeadings) {
+      if (histKws.some(kw => low(txt(h)).includes(kw))) {
+        histContainer = h.parentElement;
+        break;
+      }
+    }
+
+    if (!histContainer) return [];
+
+    const rows = [];
+    const rowEls = histContainer.querySelectorAll('[class*="row"],[class*="item"],[class*="entry"],[class*="result"]');
+    for (const row of rowEls) {
+      // Leaf-node cells only (avoid picking up nested container text)
+      const cells = [...row.querySelectorAll('span,div,td')]
+        .filter(el => el.children.length === 0)
+        .map(txt)
+        .filter(Boolean);
+
+      const dateIdx = cells.findIndex(c => dateRe.test(c));
+      if (dateIdx === -1) continue;
+
+      // Without a header row, assign columns positionally based on content type.
+      const distIdx    = cells.findIndex(c => /\b\d{3,4}m\b/i.test(c));
+      const condIdx    = cells.findIndex(c => /\b(Firm|Good|Soft|Heavy|Synthetic)/i.test(c));
+      const placeIdx   = cells.findIndex(c => /^\d+\/?(\d+)?$|^\d+(st|nd|rd|th)$/i.test(c));
+      const timeIdx    = cells.findIndex(c => /\d:\d{2}\.\d/.test(c));
+
+      rows.push({
+        date:      cells[dateIdx]                           || '',
+        placing:   placeIdx  !== -1 ? cells[placeIdx]      : '',
+        distance:  distIdx   !== -1 ? cells[distIdx]       : '',
+        condition: condIdx   !== -1 ? cells[condIdx]       : '',
+        time:      timeIdx   !== -1 ? cells[timeIdx]       : '',
+        venue: '', class: '', weight: '', barrier: '', odds: '', winner2nd: '', margin: '', inRun: '',
+      });
+    }
+    return rows;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,8 +1145,7 @@ async function main() {
     const formData = await scrapeFormData(page);
     info(`Form data scraped for ${formData.length} horses`);
 
-    info('Starting RacingZone lookups (screenshot + OCR)...');
-    const screenshotDir = path.join(outputPath, 'screenshots');
+    info('Starting RacingZone lookups (DOM scraping)...');
     const horseStats = [];
     for (let i = 0; i < runners.length; i++) {
       const runner = runners[i];
@@ -1064,7 +1154,7 @@ async function main() {
         continue;
       }
       info(`[${i + 1}/${runners.length}] RacingZone: ${runner.name}`);
-      horseStats.push(await scrapeRacingZoneHorse(page, runner.name, screenshotDir));
+      horseStats.push(await scrapeRacingZoneHorse(page, runner.name));
       if (i < runners.length - 1) await sleep(args.delayMs);
     }
 
