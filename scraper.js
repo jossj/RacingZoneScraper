@@ -499,6 +499,19 @@ async function screenshotAndOcr(page, horseName, screenshotDir) {
   }
 }
 
+// Known Australian racecourses — longer compound names listed first to avoid partial matches.
+const KNOWN_VENUES = [
+  'Sandown Hillside', 'Sandown Park', 'Moonee Valley', 'Sunshine Coast',
+  'Warwick Farm', 'Kembla Grange', 'Gold Coast', 'Eagle Farm',
+  'Flemington', 'Randwick', 'Caulfield', 'Rosehill', 'Sandown',
+  'Doomben', 'Ipswich', 'Toowoomba', 'Geelong', 'Ballarat', 'Bendigo',
+  'Cranbourne', 'Camperdown', 'Seymour', 'Pakenham', 'Morphettville',
+  'Goodwood', 'Ascot', 'Belmont', 'Hawkesbury', 'Newcastle', 'Gosford',
+  'Muswellbrook', 'Scone', 'Taree', 'Goulburn', 'Canberra',
+  'Rockhampton', 'Townsville', 'Cairns', 'Emerald',
+];
+const VENUE_REGEX = new RegExp(`\\b(${KNOWN_VENUES.join('|')})\\b`, 'i');
+
 function parseRaceRow(line) {
   // Accept dd/mm/yy, dd-mm-yy, dd.mm.yy
   //        "15 May 25" / "15 May 2025" (day-first)
@@ -511,11 +524,43 @@ function parseRaceRow(line) {
 
   const row = { date: dateMatch[1], raw: line };
 
+  // Venue
+  const venueMatch = line.match(VENUE_REGEX);
+  if (venueMatch) row.venue = venueMatch[1];
+
   // Distance: 800m – 3600m — accept "1800m" or bare "1800"
   const distM   = line.match(/\b(\d{3,4}m)\b/i);
   const distNum = !distM && line.match(/\b([6-9]\d{2}|[12]\d{3}|3[0-6]\d{2})\b/);
   if      (distM)   row.distance = distM[1];
   else if (distNum) row.distance = distNum[1] + 'm';
+
+  // Barrier: 1–2 digit number that sits between the venue name and the distance
+  if (row.venue && row.distance) {
+    const distStr  = row.distance.replace(/m$/i, '');
+    const venueEnd = line.toLowerCase().indexOf(row.venue.toLowerCase()) + row.venue.length;
+    const distIdx  = line.indexOf(distStr, venueEnd);
+    if (distIdx > venueEnd) {
+      const bm = line.slice(venueEnd, distIdx).match(/\b(\d{1,2})\b/);
+      if (bm) row.barrier = bm[1];
+    }
+  }
+
+  // Prize money: $23k, $160k, $5.4M — $ amount with k/M suffix (first match = 1st prize)
+  const prizes = line.match(/\$[\d.]+[kKmM]/g);
+  if (prizes) row.prize = prizes[0];
+
+  // Race name: text that falls between the distance and the first prize amount
+  if (row.distance && prizes) {
+    const distStr  = row.distance.replace(/m$/i, '');
+    const distIdx  = line.indexOf(distStr);
+    const prizeIdx = line.indexOf(prizes[0]);
+    if (distIdx >= 0 && prizeIdx > distIdx) {
+      const afterDist = distIdx + distStr.length +
+        (/^m/i.test(line.slice(distIdx + distStr.length)) ? 1 : 0);
+      const seg = line.slice(afterDist, prizeIdx).trim();
+      if (seg.length > 3) row.raceName = seg;
+    }
+  }
 
   // Track condition: Good4, Soft7, Heavy10, Firm, Synthetic
   const cond = line.match(/\b(Firm\d*|Good\d*|Soft\d*|Heavy\d*|Synthetic|Syn)\b/i);
@@ -539,11 +584,23 @@ function parseRaceRow(line) {
   const cls = line.match(/\b(G[123]|Gr[123]|Listed|BM\d+|MDN|CL\d+|\d+YO|WFA|Open|Hcp|HCP|FM\d*)\b/i);
   if (cls) row.class = cls[1];
 
-  // Odds / SP: $3.50 or 3.50 near end of line
-  const odds = line.match(/\$?(\d{1,3}\.\d{1,2})\s*$/);
-  if (odds) row.odds = odds[1];
+  // Jockey: capital initial + space + capitalized surname (e.g. "J Melham", "A Morgan")
+  const jockeyMatch = line.match(/\b([A-Z] [A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)\b/);
+  if (jockeyMatch) row.jockey = jockeyMatch[1];
 
-  // Weight carried: 54.0 kg, 57.5 kg — a decimal number between 48–65 not already captured as odds
+  // Odds/SP: $ amount without k/M suffix — "$9" or "$3.8" (starting price)
+  const oddsMatch = line.match(/\$(\d{1,3}(?:\.\d{1,2})?)(?![kKmM\d])/);
+  if (oddsMatch) row.odds = oddsMatch[1];
+
+  // In-run position: "9,8.8" or "11,14.5" (settling position, finishing position+lengths)
+  const inRunMatch = line.match(/\b(\d{1,2},\d{1,2}(?:\.\d+)?)\b/);
+  if (inRunMatch) row.inRun = inRunMatch[1];
+
+  // Rating change: +4 or -3 at end of line
+  const ratingChgMatch = line.match(/([+-]\d+)\s*$/);
+  if (ratingChgMatch) row.ratingChange = ratingChgMatch[1];
+
+  // Weight carried: 54.0 kg, 57.5 kg — decimal in 48–65 range not already used as odds
   const weightMatch = line.match(/\b((?:4[89]|5\d|6[0-5])(?:\.\d)?)\b/g) || [];
   const notOdds = weightMatch.filter(w => row.odds !== w);
   if (notOdds.length) row.weight = notOdds[0];
@@ -911,8 +968,9 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
   const ws7 = wb.addWorksheet('RZ Race History');
   ws7.views = [{ state: 'frozen', ySplit: 1, xSplit: 1 }];
   const rzHistCols = [
-    'Horse', 'Date', 'Distance', 'Condition', 'Class',
-    'Placing', 'Time', 'Margin', 'Weight', 'Odds', 'Raw Line',
+    'Horse', 'Date', 'Placing', 'Venue', 'Barrier', 'Distance', 'Race Name',
+    'Prize', 'Jockey', 'Weight', 'Condition', 'Class', 'Odds', 'Time',
+    'Margin', 'In-Run', 'Chg', 'Raw Line',
   ];
   styleHeader(ws7.addRow(rzHistCols), rzHistCols.length);
 
@@ -926,16 +984,23 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
     for (const entry of s.raceHistory) {
       const r = ws7.addRow([
         s.name,
-        entry.date      || '',
-        entry.distance  || '',
-        entry.condition || '',
-        entry.class     || '',
-        entry.placing   || '',
-        entry.time      || '',
-        entry.margin    || '',
-        entry.weight    || '',
-        entry.odds      || '',
-        entry.raw       || '',
+        entry.date         || '',
+        entry.placing      || '',
+        entry.venue        || '',
+        entry.barrier      || '',
+        entry.distance     || '',
+        entry.raceName     || '',
+        entry.prize        || '',
+        entry.jockey       || '',
+        entry.weight       || '',
+        entry.condition    || '',
+        entry.class        || '',
+        entry.odds         || '',
+        entry.time         || '',
+        entry.margin       || '',
+        entry.inRun        || '',
+        entry.ratingChange || '',
+        entry.raw          || '',
       ]);
       styleData(r, rzHistCols.length, alt);
       alt = !alt;
