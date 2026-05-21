@@ -437,27 +437,35 @@ async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
     const isOnHorsePage  = /\/horses?\/[^/]+\/?$/.test(afterSearchUrl);
 
     if (!isOnHorsePage) {
-      // Gather all links visible on the page and find the best name match
-      const allLinks = await page.evaluate((name) => {
-        return [...document.querySelectorAll('a')]
-          .filter(a => a.href && a.textContent.trim())
-          .map(a => ({ text: a.textContent.trim(), href: a.href }));
-      }, horseName);
-
+      // Collect all visible links whose text matches the horse name.
+      // On a multi-result page the list below the Search button is what matters;
+      // nav links won't contain the horse name so the filter keeps only result entries.
       const nl = horseName.toLowerCase();
-      const match = allLinks.find(l => l.text.toLowerCase().includes(nl))
-                 || allLinks.find(l => nl.includes(l.text.toLowerCase()) && l.text.length > 3);
+      const resultLinks = await page.evaluate((nl) => {
+        return [...document.querySelectorAll('a')]
+          .filter(a => a.offsetParent !== null && a.href && a.textContent.trim())
+          .map(a => ({ text: a.textContent.trim(), href: a.href }))
+          .filter(l =>
+            l.text.toLowerCase().includes(nl) ||
+            (nl.includes(l.text.toLowerCase()) && l.text.length > 3)
+          );
+      }, nl);
 
-      if (match) {
-        info(`  Clicking result: "${match.text}" → ${match.href}`);
+      info(`  Found ${resultLinks.length} result(s): ${resultLinks.map(l => `"${l.text}"`).join(' | ')}`);
+
+      // If multiple results are listed, pick the 2nd one (index 1) per user rule.
+      const target = resultLinks.length > 1 ? resultLinks[1] : resultLinks[0];
+
+      if (target) {
+        const which = resultLinks.length > 1 ? '2nd' : '1st';
+        info(`  Clicking ${which} result: "${target.text}" → ${target.href}`);
         await Promise.all([
           page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
-          page.goto(match.href, { waitUntil: 'networkidle2', timeout: 30000 }),
+          page.goto(target.href, { waitUntil: 'networkidle2', timeout: 30000 }),
         ]);
         await sleep(1500);
       } else {
-        // Log what was found so the user can see
-        info(`  No matching link — links on page: ${allLinks.slice(0, 10).map(l => l.text).join(', ')}`);
+        info(`  No matching link found on results page`);
       }
     }
 
