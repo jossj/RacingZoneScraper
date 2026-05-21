@@ -7,7 +7,7 @@ const path      = require('path');
 const fs        = require('fs');
 const os        = require('os');
 
-const RACINGZONE_HORSES_URL = 'https://www.racingzone.com.au/statistics/horses/';
+const RACINGZONE_HORSES_URL = 'https://www.racingzone.com.au/horses/';
 const DEFAULT_OUTPUT        = 'C:\\tab\\scrape';
 const DEFAULT_DELAY_MS      = 2000;
 
@@ -362,19 +362,15 @@ async function scrapeRacingZoneHorse(page, horseName) {
   info(`Searching RacingZone for: ${horseName}`);
   try {
     await page.goto(RACINGZONE_HORSES_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+    info(`  Landed on: ${page.url()}`);
 
-    // Candidate selectors in order of specificity — first visible match wins
+    // Find the search input — first visible match wins
     const inputSels = [
-      "input[name='horse_name']",
-      "input[name='name']",
-      "#horse_name",
-      "#name",
-      "input[placeholder*='horse' i]",
-      "input[placeholder*='Find' i]",
-      "input[placeholder*='Search' i]",
-      "input[type='search']",
-      "form input[type='text']",
-      "input[type='text']",
+      "input[name='horse_name']", "input[name='name']",
+      "#horse_name", "#name",
+      "input[placeholder*='horse' i]", "input[placeholder*='Find' i]",
+      "input[placeholder*='Search' i]", "input[type='search']",
+      "form input[type='text']", "input[type='text']",
     ];
 
     let inputSel = null;
@@ -382,19 +378,18 @@ async function scrapeRacingZoneHorse(page, horseName) {
       try {
         await page.waitForSelector(sel, { visible: true, timeout: 3000 });
         inputSel = sel;
-        info(`Found search input: ${sel}`);
+        info(`  Search input found: ${sel}`);
         break;
       } catch { /* try next */ }
     }
 
+    // Last resort: find any visible text input dynamically
     if (!inputSel) {
-      // Last resort: grab any visible text input on the page
       inputSel = await page.evaluate(() => {
         const el = [...document.querySelectorAll('input')]
           .find(i => i.offsetParent !== null &&
                      (i.type === 'text' || i.type === 'search' || i.type === ''));
         if (!el) return null;
-        // Build a unique selector
         if (el.id)   return `#${el.id}`;
         if (el.name) return `input[name="${el.name}"]`;
         return 'input[type="text"]';
@@ -406,51 +401,67 @@ async function scrapeRacingZoneHorse(page, horseName) {
     await fillInput(page, inputSel, horseName);
     await sleep(500);
 
-    // Verify the value actually landed
+    // Verify value landed
     const actual = await page.$eval(inputSel, el => el.value).catch(() => '');
     if (!actual) {
-      warn(`Input value empty after fill — retrying with keyboard only`);
+      warn(`  Input still empty — retrying with keyboard`);
       await page.click(inputSel, { clickCount: 3 });
       await page.keyboard.press('Backspace');
       await page.keyboard.type(horseName, { delay: 60 });
       await sleep(300);
     }
+    info(`  Input value: "${await page.$eval(inputSel, el => el.value).catch(() => '?')}"`);
 
-    info(`Input value confirmed: "${await page.$eval(inputSel, el => el.value).catch(() => '?')}"`);
-
-    // Submit
+    // Submit — wait for either a full navigation or AJAX settling
     const btnSels = [
-      "button[type='submit']",
-      "input[type='submit']",
-      "button[class*='search' i]",
-      "form button",
+      "button[type='submit']", "input[type='submit']",
+      "button[class*='search' i]", "form button",
     ];
-    let clicked = false;
+    let submitBtn = null;
     for (const sel of btnSels) {
-      const btn = await page.$(sel);
-      if (btn) { await btn.click(); clicked = true; break; }
+      submitBtn = await page.$(sel);
+      if (submitBtn) break;
     }
-    if (!clicked) await page.keyboard.press('Enter');
-    await sleep(3000);
 
-    // Click best-matching result link
-    const links = await page.$$('[class*="result"] a, table a, main a, #content a');
-    if (links.length) {
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
+      submitBtn ? submitBtn.click() : page.keyboard.press('Enter'),
+    ]);
+    await sleep(1500);
+    info(`  After search — URL: ${page.url()}`);
+
+    // If we're on a results list, click the best-matching horse link
+    const afterSearchUrl = page.url();
+    const isOnHorsePage  = /\/horses?\/[^/]+\/?$/.test(afterSearchUrl);
+
+    if (!isOnHorsePage) {
+      // Gather all links visible on the page and find the best name match
+      const allLinks = await page.evaluate((name) => {
+        return [...document.querySelectorAll('a')]
+          .filter(a => a.href && a.textContent.trim())
+          .map(a => ({ text: a.textContent.trim(), href: a.href }));
+      }, horseName);
+
       const nl = horseName.toLowerCase();
-      let found = false;
-      for (const link of links) {
-        const txt = (await page.evaluate(el => el.textContent, link)).toLowerCase();
-        if (txt.includes(nl) || nl.includes(txt)) {
-          await link.click();
-          found = true;
-          await sleep(3000);
-          break;
-        }
+      const match = allLinks.find(l => l.text.toLowerCase().includes(nl))
+                 || allLinks.find(l => nl.includes(l.text.toLowerCase()) && l.text.length > 3);
+
+      if (match) {
+        info(`  Clicking result: "${match.text}" → ${match.href}`);
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
+          page.goto(match.href, { waitUntil: 'networkidle2', timeout: 30000 }),
+        ]);
+        await sleep(1500);
+      } else {
+        // Log what was found so the user can see
+        info(`  No matching link — links on page: ${allLinks.slice(0, 10).map(l => l.text).join(', ')}`);
       }
-      if (!found) { await links[0].click(); await sleep(3000); }
     }
 
+    info(`  Parsing stats from: ${page.url()}`);
     await parseHorseStatsPage(page, stats);
+
   } catch (err) {
     error(`RacingZone error for ${horseName}:`, err.message);
     stats.error = err.message.slice(0, 200);
@@ -462,8 +473,17 @@ async function parseHorseStatsPage(page, stats) {
   const pageText = await page.evaluate(() => document.body.innerText);
   if (!pageText.trim()) { stats.error = 'Empty page'; return; }
 
-  await page.evaluate((s) => {
-    const detailMap = {
+  info(`  Page text preview: ${pageText.slice(0, 150).replace(/\n/g, ' ')}`);
+
+  // ── Single evaluate call — return everything, then assign back to stats ──
+  // IMPORTANT: page.evaluate serialises arguments and return values.
+  // Mutating the passed-in object inside the browser does NOT affect the
+  // Node.js object. We must return extracted data and assign it here.
+  const extracted = await page.evaluate(() => {
+    const result = {};
+
+    // Profile detail fields from table rows (label | value)
+    const detailKeywords = {
       sire:    ['sire', 'father'],
       dam:     ['dam', 'mother'],
       colour:  ['colour', 'color'],
@@ -478,45 +498,84 @@ async function parseHorseStatsPage(page, stats) {
       for (const row of tbl.querySelectorAll('tr')) {
         const cells = [...row.querySelectorAll('td, th')];
         if (cells.length < 2) continue;
-        const label = cells[0].textContent.toLowerCase().replace(/:$/, '');
+        const label = cells[0].textContent.toLowerCase().replace(/:$/, '').trim();
         const value = cells[1].textContent.trim();
-        for (const [attr, kws] of Object.entries(detailMap)) {
-          if (kws.some(kw => label.includes(kw))) { s[attr] = value; break; }
+        for (const [attr, kws] of Object.entries(detailKeywords)) {
+          if (kws.some(kw => label.includes(kw))) { result[attr] = value; break; }
         }
       }
     }
 
+    // Definition list (dl/dt/dd)
     const dts = [...document.querySelectorAll('dt')];
     const dds = [...document.querySelectorAll('dd')];
     for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
-      const label = dts[i].textContent.toLowerCase().replace(/:$/, '');
+      const label = dts[i].textContent.toLowerCase().replace(/:$/, '').trim();
       const value = dds[i].textContent.trim();
-      for (const [attr, kws] of Object.entries(detailMap)) {
-        if (kws.some(kw => label.includes(kw))) { s[attr] = value; break; }
+      for (const [attr, kws] of Object.entries(detailKeywords)) {
+        if (kws.some(kw => label.includes(kw))) { result[attr] = value; break; }
       }
     }
 
-    return s;
-  }, stats);
+    // All tables with their headers and rows (for career/L12M stats)
+    result.tables = [...document.querySelectorAll('table')].map(tbl => {
+      const headers = [...tbl.querySelectorAll('th')].map(h => h.textContent.trim());
+      const bodyRows = tbl.querySelector('tbody')
+        ? [...tbl.querySelectorAll('tbody tr')]
+        : [...tbl.querySelectorAll('tr')].slice(1);
+      const rows = bodyRows
+        .map(row => [...row.querySelectorAll('td')].map(td => td.textContent.trim()))
+        .filter(r => r.length > 0);
+      return { headers, rows };
+    }).filter(t => t.rows.length > 0);
 
-  // Stats tables
-  const tableData = await page.evaluate(() => {
-    return [...document.querySelectorAll('table')].map(tbl => ({
-      headers: [...tbl.querySelectorAll('th')].map(h => h.textContent.toLowerCase()),
-      rows: [...(tbl.querySelector('tbody') ? tbl.querySelectorAll('tbody tr') : [...tbl.querySelectorAll('tr')].slice(1))].map(row =>
-        [...row.querySelectorAll('td')].map(td => td.textContent.trim())
-      ),
-    }));
+    // Sections / headings for stats-by-X blocks
+    result.sections = [...document.querySelectorAll(
+      'section, [class*="stats"], [class*="Statistics"], h2, h3, h4'
+    )].map(el => ({
+      tag:  el.tagName,
+      cls:  el.className || '',
+      text: el.innerText ? el.innerText.trim().slice(0, 600) : '',
+    })).filter(s => s.text);
+
+    return result;
   });
 
-  for (const { headers, rows } of tableData) {
+  // Assign profile fields back (this is what was missing before)
+  const profileFields = ['sire', 'dam', 'colour', 'sex', 'age', 'country', 'owner', 'breeder'];
+  for (const f of profileFields) {
+    if (extracted[f]) stats[f] = extracted[f];
+  }
+
+  // Parse career / L12M stats tables
+  for (const { headers, rows } of extracted.tables || []) {
+    const hdrs = headers.map(h => h.toLowerCase());
+    info(`  Table [${headers.join(' | ')}]`);
     for (const cells of rows) {
       if (!cells.length) continue;
       const label = cells[0].toLowerCase();
+      info(`    Row: ${cells.join(' | ')}`);
       if (label.includes('career') || label.includes('total') || label.includes('all')) {
-        fillStats(stats, cells, headers, 'career');
+        fillStats(stats, cells, hdrs, 'career');
       } else if (label.includes('12') || label.includes('l12') || label.includes('year')) {
-        fillStats(stats, cells, headers, 'l12m');
+        fillStats(stats, cells, hdrs, 'l12m');
+      }
+    }
+  }
+
+  // Stats-by-X sections as raw text
+  const sectionKeywords = {
+    statsByDistance:  ['distance', 'dist'],
+    statsByCondition: ['condition', 'going', 'track cond'],
+    statsByTrackType: ['track type', 'surface'],
+    statsByJockey:    ['jockey'],
+    statsByTrainer:   ['trainer'],
+  };
+  for (const sec of extracted.sections || []) {
+    const lower = (sec.text + ' ' + sec.cls).toLowerCase();
+    for (const [attr, kws] of Object.entries(sectionKeywords)) {
+      if (!stats[attr] && kws.some(kw => lower.includes(kw))) {
+        stats[attr] = sec.text.slice(0, 2000);
       }
     }
   }
