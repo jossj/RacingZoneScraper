@@ -7,6 +7,7 @@ const path               = require('path');
 const fs                 = require('fs');
 const os                 = require('os');
 const { createWorker }   = require('tesseract.js');
+const sharp              = require('sharp');
 
 const RACINGZONE_HORSES_URL = 'https://www.racingzone.com.au/horses/';
 const DEFAULT_OUTPUT        = 'C:\\tab\\scrape';
@@ -496,10 +497,22 @@ async function screenshotAndOcr(page, horseName, screenshotDir) {
   await page.screenshot({ path: imgPath, fullPage: true });
   info(`  Screenshot saved: ${imgPath}`);
 
-  // Run OCR with tesseract.js
+  // Pre-process for OCR: grayscale + normalize contrast.
+  // Grayscale removes colour noise; normalize stretches the histogram so text
+  // is as dark as possible against a white background.  A hard threshold is
+  // intentionally skipped — Tesseract's internal Otsu binarizer handles
+  // anti-aliased web text better than a fixed cut-off.
+  const ocrImgPath = imgPath.replace(/\.png$/, '_ocr.png');
+  await sharp(imgPath)
+    .grayscale()
+    .normalize()
+    .toFile(ocrImgPath);
+  info(`  OCR image prepared (grayscale+normalize): ${ocrImgPath}`);
+
+  // Run OCR with tesseract.js on the pre-processed image
   const worker = await createWorker('eng');
   try {
-    const { data: { text } } = await worker.recognize(imgPath);
+    const { data: { text } } = await worker.recognize(ocrImgPath);
     info(`  OCR complete: ${text.length} chars extracted`);
     return text;
   } finally {
