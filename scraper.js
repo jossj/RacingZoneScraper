@@ -500,8 +500,10 @@ async function screenshotAndOcr(page, horseName, screenshotDir) {
 }
 
 function parseRaceRow(line) {
-  // A valid race history row must contain a date in dd/mm/yy or dd/mm/yyyy format
-  const dateMatch = line.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/);
+  // Accept dd/mm/yy, dd-mm-yy, dd.mm.yy  OR  "15 May 25" / "15 May 2025"
+  const dateMatch =
+    line.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/) ||
+    line.match(/\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]+\d{2,4})\b/i);
   if (!dateMatch) return null;
 
   const row = { date: dateMatch[1], raw: line };
@@ -544,8 +546,19 @@ function parseRaceRow(line) {
   return row;
 }
 
+// Keywords that indicate a race history section on RacingZone (case-insensitive)
+const HISTORY_HEADINGS = [
+  'race history', 'past runs', 'run history', 'recent runs', 'form history',
+  'recent form', 'last starts', 'race record', 'race starts', 'form guide',
+  'past performances', 'run record', 'recent starts', 'race results',
+  'last runs', 'past starts', 'race form', 'last performances',
+];
+
 function parseOcrText(rawText, stats) {
   const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+
+  // Log first 300 chars of OCR to help diagnose heading / format issues
+  info(`  OCR preview: ${rawText.slice(0, 300).replace(/\n/g, ' ↵ ')}`);
 
   // Phase 1 — scan every line for profile fields, career stats, section headings
   let currentSection = null;
@@ -556,19 +569,16 @@ function parseOcrText(rawText, stats) {
     const lower = line.toLowerCase();
 
     // ── Detect race history section start ────────────────────────────────────
-    if (!inHistory && (
-      lower.includes('race history') || lower.includes('past runs') ||
-      lower.includes('run history')  || lower.includes('recent runs') ||
-      lower.includes('form history')
-    )) {
+    if (!inHistory && HISTORY_HEADINGS.some(h => lower.includes(h))) {
       inHistory = true;
       currentSection = null;
+      info(`  Race history section detected on line: "${line}"`);
       continue;
     }
 
     // ── Inside race history — collect rows then stop at next major section ───
     if (inHistory) {
-      if (lower.match(/^(stats by|by distance|by condition|by track|by jockey|by trainer|career record|trainer|jockey)\b/)) {
+      if (lower.match(/^(stats by|by distance|by condition|by track|by jockey|by trainer|career record)\b/)) {
         inHistory = false;
         // fall through to section-heading handling below
       } else {
@@ -642,6 +652,20 @@ function parseOcrText(rawText, stats) {
   if (sections.condition.length) stats.statsByCondition = sections.condition.join('\n');
   if (sections.jockey.length)    stats.statsByJockey    = sections.jockey.join('\n');
   if (sections.trainer.length)   stats.statsByTrainer   = sections.trainer.join('\n');
+
+  // Fallback: no section heading was detected — scan every line for anything
+  // that looks like a race row (date + at least one other racing field).
+  if (stats.raceHistory.length === 0) {
+    info(`  No race history heading found — running fallback line scan`);
+    for (const line of lines) {
+      const row = parseRaceRow(line);
+      if (row && (row.distance || row.condition || row.class || row.placing || row.time)) {
+        stats.raceHistory.push(row);
+      }
+    }
+    if (stats.raceHistory.length > 0)
+      info(`  Fallback scan found ${stats.raceHistory.length} race rows`);
+  }
 
   info(`  Parsed — career: ${stats.careerStarts}/${stats.careerWins}/${stats.careerSeconds}/${stats.careerThirds} | sire: ${stats.sire || '–'} | history rows: ${stats.raceHistory.length}`);
 }
