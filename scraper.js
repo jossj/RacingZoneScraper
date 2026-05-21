@@ -6,7 +6,8 @@ const readline           = require('readline');
 const path               = require('path');
 const fs                 = require('fs');
 const os                 = require('os');
-const { createWorker }   = require('tesseract.js');
+const { createWorker, PSM, OEM } = require('tesseract.js');
+const sharp              = require('sharp');
 
 const RACINGZONE_HORSES_URL = 'https://www.racingzone.com.au/horses/';
 const DEFAULT_OUTPUT        = 'C:\\tab\\scrape';
@@ -480,6 +481,7 @@ async function screenshotAndOcr(page, horseName, screenshotDir) {
   fs.mkdirSync(screenshotDir, { recursive: true });
   const safeName = horseName.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 50);
   const imgPath  = path.join(screenshotDir, `${safeName}.png`);
+  const procPath = path.join(screenshotDir, `${safeName}_ocr.png`);
 
   // Scroll to top so the full page starts from the beginning
   await page.evaluate(() => window.scrollTo(0, 0));
@@ -488,10 +490,26 @@ async function screenshotAndOcr(page, horseName, screenshotDir) {
   await page.screenshot({ path: imgPath, fullPage: true });
   info(`  Screenshot saved: ${imgPath}`);
 
-  // Run OCR with tesseract.js
-  const worker = await createWorker('eng');
+  // Preprocess for better OCR accuracy:
+  //   • 2× upscale — Tesseract is calibrated for ~300 DPI; browser screenshots are ~96 DPI
+  //   • greyscale  — eliminates colour noise that confuses character recognition
+  //   • normalise  — stretches histogram to full range, improving low-contrast sections
+  //   • sharpen    — crispens text edges blurred by the browser's sub-pixel rendering
+  const { width } = await sharp(imgPath).metadata();
+  await sharp(imgPath)
+    .resize({ width: width * 2, kernel: sharp.kernel.lanczos3 })
+    .greyscale()
+    .normalise()
+    .sharpen({ sigma: 1 })
+    .toFile(procPath);
+  info(`  OCR image preprocessed: ${width}px → ${width * 2}px wide`);
+
+  // LSTM_ONLY (OEM 1) is Tesseract's neural-net engine — more accurate than the
+  // legacy character classifier, especially on varied fonts and tabular layouts.
+  const worker = await createWorker('eng', OEM.LSTM_ONLY);
   try {
-    const { data: { text } } = await worker.recognize(imgPath);
+    await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
+    const { data: { text } } = await worker.recognize(procPath);
     info(`  OCR complete: ${text.length} chars extracted`);
     return text;
   } finally {
