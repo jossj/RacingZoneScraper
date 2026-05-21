@@ -358,6 +358,7 @@ async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
     l12mStarts: '', l12mWins: '', l12mSeconds: '', l12mThirds: '',
     statsByDistance: '', statsByCondition: '', statsByTrackType: '',
     statsByJockey: '', statsByTrainer: '',
+    raceHistory: [],   // populated from OCR
   };
 
   info(`Searching RacingZone for: ${horseName}`);
@@ -498,35 +499,102 @@ async function screenshotAndOcr(page, horseName, screenshotDir) {
   }
 }
 
+function parseRaceRow(line) {
+  // A valid race history row must contain a date in dd/mm/yy or dd/mm/yyyy format
+  const dateMatch = line.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/);
+  if (!dateMatch) return null;
+
+  const row = { date: dateMatch[1], raw: line };
+
+  // Distance: 800m – 3200m
+  const dist = line.match(/\b(\d{3,4}m)\b/i);
+  if (dist) row.distance = dist[1];
+
+  // Track condition: Good4, Soft7, Heavy10, Firm, Synthetic
+  const cond = line.match(/\b(Firm\d*|Good\d*|Soft\d*|Heavy\d*|Synthetic|Syn)\b/i);
+  if (cond) row.condition = cond[1];
+
+  // Placing: "1st" / "2nd" / "3rd" / "1/8" (position of X runners)
+  const placeSlash = line.match(/\b(\d{1,2})\/(\d{1,2})\b/);
+  const placeSuffix = line.match(/\b(\d+(?:st|nd|rd|th))\b/i);
+  if (placeSlash)       row.placing = `${placeSlash[1]}/${placeSlash[2]}`;
+  else if (placeSuffix) row.placing = placeSuffix[1];
+
+  // Race time: 1:09.50 or 0:57.30
+  const time = line.match(/\b(\d:\d{2}\.\d{1,2})\b/);
+  if (time) row.time = time[1];
+
+  // Margin: 0.5L, 2.5L, SH, NK, LH, HD, NS
+  const margin = line.match(/\b(\d+(?:\.\d+)?L|(?:SH|NK|LH|HD|NS|NOS|NECK|HEAD))\b/i);
+  if (margin) row.margin = margin[1];
+
+  // Race class: G1 G2 G3, Listed, BM64, MDN, CL1, 2YO, WFA, Open, Hcp
+  const cls = line.match(/\b(G[123]|Gr[123]|Listed|BM\d+|MDN|CL\d+|\d+YO|WFA|Open|Hcp|HCP|FM\d*)\b/i);
+  if (cls) row.class = cls[1];
+
+  // Odds / SP: $3.50 or 3.50 near end of line
+  const odds = line.match(/\$?(\d{1,3}\.\d{1,2})\s*$/);
+  if (odds) row.odds = odds[1];
+
+  // Weight carried: 54.0 kg, 57.5 kg — a decimal number between 48–65 not already captured as odds
+  const weightMatch = line.match(/\b((?:4[89]|5\d|6[0-5])(?:\.\d)?)\b/g) || [];
+  const notOdds = weightMatch.filter(w => row.odds !== w);
+  if (notOdds.length) row.weight = notOdds[0];
+
+  return row;
+}
+
 function parseOcrText(rawText, stats) {
   const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
 
-  // Track current section for multi-line block capture
+  // Phase 1 — scan every line for profile fields, career stats, section headings
   let currentSection = null;
+  let inHistory      = false;
   const sections = { distance: [], condition: [], jockey: [], trainer: [] };
 
   for (const line of lines) {
     const lower = line.toLowerCase();
 
-    // ── Key: Value pairs ────────────────────────────────────────────────────
-    // Matches "Sire: Fastnet Rock", "Trainer: John Smith", etc.
+    // ── Detect race history section start ────────────────────────────────────
+    if (!inHistory && (
+      lower.includes('race history') || lower.includes('past runs') ||
+      lower.includes('run history')  || lower.includes('recent runs') ||
+      lower.includes('form history')
+    )) {
+      inHistory = true;
+      currentSection = null;
+      continue;
+    }
+
+    // ── Inside race history — collect rows then stop at next major section ───
+    if (inHistory) {
+      if (lower.match(/^(stats by|by distance|by condition|by track|by jockey|by trainer|career record|trainer|jockey)\b/)) {
+        inHistory = false;
+        // fall through to section-heading handling below
+      } else {
+        const row = parseRaceRow(line);
+        if (row) stats.raceHistory.push(row);
+        continue;
+      }
+    }
+
+    // ── Key: Value pairs (Sire, Dam, Colour, etc.) ──────────────────────────
     const kv = line.match(/^([A-Za-z][\w &/]+?):\s*(.+)$/);
     if (kv) {
       const key = kv[1].toLowerCase().trim();
       const val = kv[2].trim();
-      if (key.includes('sire'))                        stats.sire    = stats.sire    || val;
-      if (key.includes('dam'))                         stats.dam     = stats.dam     || val;
-      if (key.includes('colour') || key === 'color')   stats.colour  = stats.colour  || val;
-      if (key === 'sex' || key === 'gender')           stats.sex     = stats.sex     || val;
-      if (key === 'age')                               stats.age     = stats.age     || val;
-      if (key.includes('trainer'))                     stats.trainer = stats.trainer || val;
-      if (key.includes('owner'))                       stats.owner   = stats.owner   || val;
-      if (key.includes('breeder'))                     stats.breeder = stats.breeder || val;
-      if (key.includes('country') || key === 'origin') stats.country = stats.country || val;
+      if (key.includes('sire'))                         stats.sire    = stats.sire    || val;
+      if (key.includes('dam'))                          stats.dam     = stats.dam     || val;
+      if (key.includes('colour') || key === 'color')    stats.colour  = stats.colour  || val;
+      if (key === 'sex' || key === 'gender')            stats.sex     = stats.sex     || val;
+      if (key === 'age')                                stats.age     = stats.age     || val;
+      if (key.includes('trainer'))                      stats.trainer = stats.trainer || val;
+      if (key.includes('owner'))                        stats.owner   = stats.owner   || val;
+      if (key.includes('breeder'))                      stats.breeder = stats.breeder || val;
+      if (key.includes('country') || key === 'origin')  stats.country = stats.country || val;
     }
 
     // ── Career stats row ─────────────────────────────────────────────────────
-    // Looks for lines like: "Career  25  5  4  3  $150,000"
     if (lower.includes('career') && !lower.includes('prize')) {
       const nums  = line.match(/\d[\d,]*/g) || [];
       const prize = line.match(/\$[\d,]+/);
@@ -556,13 +624,12 @@ function parseOcrText(rawText, stats) {
     if (winPctMatch   && !stats.careerWinPct)   stats.careerWinPct   = winPctMatch[1].trim();
     if (placePctMatch && !stats.careerPlacePct) stats.careerPlacePct = placePctMatch[1].trim();
 
-    // ── Section heading detection ────────────────────────────────────────────
+    // ── Stats-by-X section headings ──────────────────────────────────────────
     if      (lower.includes('by distance') || (lower.includes('distance') && lower.length < 25))  currentSection = 'distance';
     else if (lower.includes('by condition') || (lower.includes('condition') && lower.length < 25)) currentSection = 'condition';
     else if (lower.includes('by jockey')   || (lower.includes('jockey')   && lower.length < 25))  currentSection = 'jockey';
     else if (lower.includes('by trainer')  || (lower.includes('trainer')  && lower.length < 25))  currentSection = 'trainer';
     else if (currentSection) {
-      // Stop collecting when we hit what looks like a new section heading
       if (line.length < 30 && /^[A-Z]/.test(line) && !/\d/.test(line)) {
         currentSection = null;
       } else {
@@ -576,7 +643,7 @@ function parseOcrText(rawText, stats) {
   if (sections.jockey.length)    stats.statsByJockey    = sections.jockey.join('\n');
   if (sections.trainer.length)   stats.statsByTrainer   = sections.trainer.join('\n');
 
-  info(`  Parsed — career: ${stats.careerStarts}/${stats.careerWins}/${stats.careerSeconds}/${stats.careerThirds} | sire: ${stats.sire || '–'}`);
+  info(`  Parsed — career: ${stats.careerStarts}/${stats.careerWins}/${stats.careerSeconds}/${stats.careerThirds} | sire: ${stats.sire || '–'} | history rows: ${stats.raceHistory.length}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +876,42 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
     ]), rzCols.length, i % 2 === 1);
   });
   autoWidth(ws6);
+
+  // ── Sheet 7: RZ Race History ───────────────────────────────────────────
+  const ws7 = wb.addWorksheet('RZ Race History');
+  ws7.views = [{ state: 'frozen', ySplit: 1, xSplit: 1 }];
+  const rzHistCols = [
+    'Horse', 'Date', 'Distance', 'Condition', 'Class',
+    'Placing', 'Time', 'Margin', 'Weight', 'Odds', 'Raw Line',
+  ];
+  styleHeader(ws7.addRow(rzHistCols), rzHistCols.length);
+
+  for (const s of horseStats) {
+    if (!s.raceHistory || !s.raceHistory.length) continue;
+
+    const secRow = ws7.addRow([s.name, ...Array(rzHistCols.length - 1).fill('')]);
+    styleSection(secRow, rzHistCols.length);
+
+    let alt = false;
+    for (const entry of s.raceHistory) {
+      const r = ws7.addRow([
+        s.name,
+        entry.date      || '',
+        entry.distance  || '',
+        entry.condition || '',
+        entry.class     || '',
+        entry.placing   || '',
+        entry.time      || '',
+        entry.margin    || '',
+        entry.weight    || '',
+        entry.odds      || '',
+        entry.raw       || '',
+      ]);
+      styleData(r, rzHistCols.length, alt);
+      alt = !alt;
+    }
+  }
+  autoWidth(ws7);
 
   await wb.xlsx.writeFile(filepath);
   info('Excel saved:', filepath);
