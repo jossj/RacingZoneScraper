@@ -945,11 +945,24 @@ def resolve_output_path(raw: str) -> str:
     return raw.replace("\\", "/")
 
 
+def prompt_for_url() -> str:
+    print("\n" + "=" * 60)
+    print("  Horse Racing Scraper")
+    print("=" * 60)
+    print("Paste the full URL of the TAB race page and press Enter.")
+    print("Example: https://www.tab.com.au/racing/meetings/RANDWICK/...")
+    print()
+    while True:
+        url = input("TAB race URL: ").strip()
+        if url.startswith("http"):
+            return url
+        print("  Please enter a valid URL starting with http.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Scrape TAB race + RacingZone horse stats → Excel"
     )
-    parser.add_argument("url", help="Full URL of the TAB race page")
     parser.add_argument(
         "--output",
         default=r"C:\tab\scrape",
@@ -981,6 +994,8 @@ def main():
     )
     args = parser.parse_args()
 
+    url = prompt_for_url()
+
     output_path = resolve_output_path(args.output)
     log.info("Output directory: %s", output_path)
 
@@ -990,7 +1005,7 @@ def main():
         driver.set_page_load_timeout(60)
 
         # Step 1: Scrape TAB race page
-        race = scrape_tab_page(driver, args.url)
+        race = scrape_tab_page(driver, url)
 
         if not race.runners:
             log.error(

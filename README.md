@@ -18,14 +18,25 @@ pip install -r requirements.txt
 ## Usage
 
 ```
-python scraper.py <TAB_RACE_URL> [options]
+python scraper.py [options]
 ```
 
-### Arguments
+When you run the script it will prompt you to paste the TAB race URL:
 
-| Argument | Default | Description |
+```
+============================================================
+  Horse Racing Scraper
+============================================================
+Paste the full URL of the TAB race page and press Enter.
+Example: https://www.tab.com.au/racing/meetings/RANDWICK/...
+
+TAB race URL: <paste here>
+```
+
+### Options
+
+| Option | Default | Description |
 |---|---|---|
-| `url` | *(required)* | Full URL of the TAB race page |
 | `--output` | `C:\tab\scrape` | Directory to save the Excel file |
 | `--browser` | `chrome` | `chrome` or `firefox` |
 | `--headless` | on | Run browser invisibly (default) |
@@ -35,17 +46,14 @@ python scraper.py <TAB_RACE_URL> [options]
 ### Examples
 
 ```bash
-# Scrape a race and save to the default location
-python scraper.py "https://www.tab.com.au/racing/meetings/RANDWICK/2024-11-02/races/1"
+# Run and enter the URL when prompted
+python scraper.py
 
 # Show browser window (good for debugging)
-python scraper.py "https://www.tab.com.au/..." --no-headless
+python scraper.py --no-headless
 
 # Use Firefox and a custom output folder
-python scraper.py "https://www.tab.com.au/..." --browser firefox --output "D:\racing"
-
-# On Linux/Mac — output goes to ~/tab/scrape automatically
-python scraper.py "https://www.tab.com.au/..."
+python scraper.py --browser firefox --output "D:\racing"
 ```
 
 ## Output
