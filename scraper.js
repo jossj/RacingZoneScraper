@@ -347,9 +347,6 @@ async function fillInput(page, selector, value) {
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
   }, selector, value);
-
-  // Belt-and-suspenders: also physically type it (helps with non-React fields)
-  await page.type(selector, value, { delay: 40 });
 }
 
 async function scrapeRacingZoneHorse(page, horseName) {
@@ -414,6 +411,7 @@ async function scrapeRacingZoneHorse(page, horseName) {
     if (!actual) {
       warn(`Input value empty after fill — retrying with keyboard only`);
       await page.click(inputSel, { clickCount: 3 });
+      await page.keyboard.press('Backspace');
       await page.keyboard.type(horseName, { delay: 60 });
       await sleep(300);
     }
