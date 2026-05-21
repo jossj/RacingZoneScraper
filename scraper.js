@@ -546,12 +546,12 @@ function parseRaceRow(line) {
   return row;
 }
 
-// Keywords that indicate a race history section on RacingZone (case-insensitive)
+// Keywords that indicate a race history section on RacingZone (case-insensitive).
+// Deliberately excludes nav-menu phrases like "Form Guide", "Recent Form", "Race Form".
 const HISTORY_HEADINGS = [
   'race history', 'past runs', 'run history', 'recent runs', 'form history',
-  'recent form', 'last starts', 'race record', 'race starts', 'form guide',
-  'past performances', 'run record', 'recent starts', 'race results',
-  'last runs', 'past starts', 'race form', 'last performances',
+  'last starts', 'race record', 'past performances', 'run record',
+  'recent starts', 'race results', 'last runs', 'past starts', 'last performances',
 ];
 
 function parseOcrText(rawText, stats) {
@@ -569,7 +569,8 @@ function parseOcrText(rawText, stats) {
     const lower = line.toLowerCase();
 
     // ── Detect race history section start ────────────────────────────────────
-    if (!inHistory && HISTORY_HEADINGS.some(h => lower.includes(h))) {
+    // Guard: line must be short (≤40 chars) so nav-bar sentences don't match.
+    if (!inHistory && line.length <= 40 && HISTORY_HEADINGS.some(h => lower.includes(h))) {
       inHistory = true;
       currentSection = null;
       info(`  Race history section detected on line: "${line}"`);
