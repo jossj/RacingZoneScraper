@@ -1,11 +1,12 @@
 'use strict';
 
-const puppeteer = require('puppeteer');
-const ExcelJS   = require('exceljs');
-const readline  = require('readline');
-const path      = require('path');
-const fs        = require('fs');
-const os        = require('os');
+const puppeteer          = require('puppeteer');
+const ExcelJS            = require('exceljs');
+const readline           = require('readline');
+const path               = require('path');
+const fs                 = require('fs');
+const os                 = require('os');
+const { createWorker }   = require('tesseract.js');
 
 const RACINGZONE_HORSES_URL = 'https://www.racingzone.com.au/horses/';
 const DEFAULT_OUTPUT        = 'C:\\tab\\scrape';
@@ -349,7 +350,7 @@ async function fillInput(page, selector, value) {
   }, selector, value);
 }
 
-async function scrapeRacingZoneHorse(page, horseName) {
+async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
   const stats = {
     name: horseName, error: '',
     careerStarts: '', careerWins: '', careerSeconds: '', careerThirds: '',
@@ -459,8 +460,9 @@ async function scrapeRacingZoneHorse(page, horseName) {
       }
     }
 
-    info(`  Parsing stats from: ${page.url()}`);
-    await parseHorseStatsPage(page, stats);
+    info(`  Taking screenshot and running OCR: ${page.url()}`);
+    const ocrText = await screenshotAndOcr(page, horseName, screenshotDir);
+    parseOcrText(ocrText, stats);
 
   } catch (err) {
     error(`RacingZone error for ${horseName}:`, err.message);
@@ -469,132 +471,112 @@ async function scrapeRacingZoneHorse(page, horseName) {
   return stats;
 }
 
-async function parseHorseStatsPage(page, stats) {
-  const pageText = await page.evaluate(() => document.body.innerText);
-  if (!pageText.trim()) { stats.error = 'Empty page'; return; }
+// ---------------------------------------------------------------------------
+// Screenshot → OCR → parse  (replaces DOM scraping for RacingZone)
+// ---------------------------------------------------------------------------
 
-  info(`  Page text preview: ${pageText.slice(0, 150).replace(/\n/g, ' ')}`);
+async function screenshotAndOcr(page, horseName, screenshotDir) {
+  fs.mkdirSync(screenshotDir, { recursive: true });
+  const safeName = horseName.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 50);
+  const imgPath  = path.join(screenshotDir, `${safeName}.png`);
 
-  // ── Single evaluate call — return everything, then assign back to stats ──
-  // IMPORTANT: page.evaluate serialises arguments and return values.
-  // Mutating the passed-in object inside the browser does NOT affect the
-  // Node.js object. We must return extracted data and assign it here.
-  const extracted = await page.evaluate(() => {
-    const result = {};
+  // Scroll to top so the full page starts from the beginning
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await sleep(500);
 
-    // Profile detail fields from table rows (label | value)
-    const detailKeywords = {
-      sire:    ['sire', 'father'],
-      dam:     ['dam', 'mother'],
-      colour:  ['colour', 'color'],
-      sex:     ['sex', 'gender'],
-      age:     ['age'],
-      country: ['country', 'origin'],
-      owner:   ['owner'],
-      breeder: ['breeder'],
-    };
+  await page.screenshot({ path: imgPath, fullPage: true });
+  info(`  Screenshot saved: ${imgPath}`);
 
-    for (const tbl of document.querySelectorAll('table')) {
-      for (const row of tbl.querySelectorAll('tr')) {
-        const cells = [...row.querySelectorAll('td, th')];
-        if (cells.length < 2) continue;
-        const label = cells[0].textContent.toLowerCase().replace(/:$/, '').trim();
-        const value = cells[1].textContent.trim();
-        for (const [attr, kws] of Object.entries(detailKeywords)) {
-          if (kws.some(kw => label.includes(kw))) { result[attr] = value; break; }
-        }
-      }
-    }
-
-    // Definition list (dl/dt/dd)
-    const dts = [...document.querySelectorAll('dt')];
-    const dds = [...document.querySelectorAll('dd')];
-    for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
-      const label = dts[i].textContent.toLowerCase().replace(/:$/, '').trim();
-      const value = dds[i].textContent.trim();
-      for (const [attr, kws] of Object.entries(detailKeywords)) {
-        if (kws.some(kw => label.includes(kw))) { result[attr] = value; break; }
-      }
-    }
-
-    // All tables with their headers and rows (for career/L12M stats)
-    result.tables = [...document.querySelectorAll('table')].map(tbl => {
-      const headers = [...tbl.querySelectorAll('th')].map(h => h.textContent.trim());
-      const bodyRows = tbl.querySelector('tbody')
-        ? [...tbl.querySelectorAll('tbody tr')]
-        : [...tbl.querySelectorAll('tr')].slice(1);
-      const rows = bodyRows
-        .map(row => [...row.querySelectorAll('td')].map(td => td.textContent.trim()))
-        .filter(r => r.length > 0);
-      return { headers, rows };
-    }).filter(t => t.rows.length > 0);
-
-    // Sections / headings for stats-by-X blocks
-    result.sections = [...document.querySelectorAll(
-      'section, [class*="stats"], [class*="Statistics"], h2, h3, h4'
-    )].map(el => ({
-      tag:  el.tagName,
-      cls:  el.className || '',
-      text: el.innerText ? el.innerText.trim().slice(0, 600) : '',
-    })).filter(s => s.text);
-
-    return result;
-  });
-
-  // Assign profile fields back (this is what was missing before)
-  const profileFields = ['sire', 'dam', 'colour', 'sex', 'age', 'country', 'owner', 'breeder'];
-  for (const f of profileFields) {
-    if (extracted[f]) stats[f] = extracted[f];
-  }
-
-  // Parse career / L12M stats tables
-  for (const { headers, rows } of extracted.tables || []) {
-    const hdrs = headers.map(h => h.toLowerCase());
-    info(`  Table [${headers.join(' | ')}]`);
-    for (const cells of rows) {
-      if (!cells.length) continue;
-      const label = cells[0].toLowerCase();
-      info(`    Row: ${cells.join(' | ')}`);
-      if (label.includes('career') || label.includes('total') || label.includes('all')) {
-        fillStats(stats, cells, hdrs, 'career');
-      } else if (label.includes('12') || label.includes('l12') || label.includes('year')) {
-        fillStats(stats, cells, hdrs, 'l12m');
-      }
-    }
-  }
-
-  // Stats-by-X sections as raw text
-  const sectionKeywords = {
-    statsByDistance:  ['distance', 'dist'],
-    statsByCondition: ['condition', 'going', 'track cond'],
-    statsByTrackType: ['track type', 'surface'],
-    statsByJockey:    ['jockey'],
-    statsByTrainer:   ['trainer'],
-  };
-  for (const sec of extracted.sections || []) {
-    const lower = (sec.text + ' ' + sec.cls).toLowerCase();
-    for (const [attr, kws] of Object.entries(sectionKeywords)) {
-      if (!stats[attr] && kws.some(kw => lower.includes(kw))) {
-        stats[attr] = sec.text.slice(0, 2000);
-      }
-    }
+  // Run OCR with tesseract.js
+  const worker = await createWorker('eng');
+  try {
+    const { data: { text } } = await worker.recognize(imgPath);
+    info(`  OCR complete: ${text.length} chars extracted`);
+    return text;
+  } finally {
+    await worker.terminate();
   }
 }
 
-function fillStats(stats, cells, headers, prefix) {
-  const mapping = {
-    start: `${prefix}Starts`, win: `${prefix}Wins`,
-    '2nd': `${prefix}Seconds`, second: `${prefix}Seconds`,
-    '3rd': `${prefix}Thirds`,  third: `${prefix}Thirds`,
-    'win%': `${prefix}WinPct`, 'place%': `${prefix}PlacePct`,
-    prize: `${prefix}PrizeMoney`, earning: `${prefix}PrizeMoney`,
-  };
-  cells.slice(1).forEach((val, idx) => {
-    const hdr = (headers[idx] || '').toLowerCase();
-    for (const [key, attr] of Object.entries(mapping)) {
-      if (hdr.includes(key) && attr in stats) { stats[attr] = val; break; }
+function parseOcrText(rawText, stats) {
+  const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+
+  // Track current section for multi-line block capture
+  let currentSection = null;
+  const sections = { distance: [], condition: [], jockey: [], trainer: [] };
+
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+
+    // ── Key: Value pairs ────────────────────────────────────────────────────
+    // Matches "Sire: Fastnet Rock", "Trainer: John Smith", etc.
+    const kv = line.match(/^([A-Za-z][\w &/]+?):\s*(.+)$/);
+    if (kv) {
+      const key = kv[1].toLowerCase().trim();
+      const val = kv[2].trim();
+      if (key.includes('sire'))                        stats.sire    = stats.sire    || val;
+      if (key.includes('dam'))                         stats.dam     = stats.dam     || val;
+      if (key.includes('colour') || key === 'color')   stats.colour  = stats.colour  || val;
+      if (key === 'sex' || key === 'gender')           stats.sex     = stats.sex     || val;
+      if (key === 'age')                               stats.age     = stats.age     || val;
+      if (key.includes('trainer'))                     stats.trainer = stats.trainer || val;
+      if (key.includes('owner'))                       stats.owner   = stats.owner   || val;
+      if (key.includes('breeder'))                     stats.breeder = stats.breeder || val;
+      if (key.includes('country') || key === 'origin') stats.country = stats.country || val;
     }
-  });
+
+    // ── Career stats row ─────────────────────────────────────────────────────
+    // Looks for lines like: "Career  25  5  4  3  $150,000"
+    if (lower.includes('career') && !lower.includes('prize')) {
+      const nums  = line.match(/\d[\d,]*/g) || [];
+      const prize = line.match(/\$[\d,]+/);
+      if (nums.length >= 4) {
+        if (!stats.careerStarts)  stats.careerStarts  = nums[0];
+        if (!stats.careerWins)    stats.careerWins    = nums[1];
+        if (!stats.careerSeconds) stats.careerSeconds = nums[2];
+        if (!stats.careerThirds)  stats.careerThirds  = nums[3];
+      }
+      if (prize && !stats.careerPrizeMoney) stats.careerPrizeMoney = prize[0];
+    }
+
+    // ── Last 12 months row ──────────────────────────────────────────────────
+    if ((lower.includes('last 12') || lower.includes('l12') || lower.includes('12 month')) && !stats.l12mStarts) {
+      const nums = line.match(/\d[\d,]*/g) || [];
+      if (nums.length >= 4) {
+        stats.l12mStarts  = nums[0];
+        stats.l12mWins    = nums[1];
+        stats.l12mSeconds = nums[2];
+        stats.l12mThirds  = nums[3];
+      }
+    }
+
+    // ── Win % / Place % ─────────────────────────────────────────────────────
+    const winPctMatch   = line.match(/win[s]?\s*[:%]\s*([\d.]+\s*%?)/i);
+    const placePctMatch = line.match(/place[s]?\s*[:%]\s*([\d.]+\s*%?)/i);
+    if (winPctMatch   && !stats.careerWinPct)   stats.careerWinPct   = winPctMatch[1].trim();
+    if (placePctMatch && !stats.careerPlacePct) stats.careerPlacePct = placePctMatch[1].trim();
+
+    // ── Section heading detection ────────────────────────────────────────────
+    if      (lower.includes('by distance') || (lower.includes('distance') && lower.length < 25))  currentSection = 'distance';
+    else if (lower.includes('by condition') || (lower.includes('condition') && lower.length < 25)) currentSection = 'condition';
+    else if (lower.includes('by jockey')   || (lower.includes('jockey')   && lower.length < 25))  currentSection = 'jockey';
+    else if (lower.includes('by trainer')  || (lower.includes('trainer')  && lower.length < 25))  currentSection = 'trainer';
+    else if (currentSection) {
+      // Stop collecting when we hit what looks like a new section heading
+      if (line.length < 30 && /^[A-Z]/.test(line) && !/\d/.test(line)) {
+        currentSection = null;
+      } else {
+        sections[currentSection].push(line);
+      }
+    }
+  }
+
+  if (sections.distance.length)  stats.statsByDistance  = sections.distance.join('\n');
+  if (sections.condition.length) stats.statsByCondition = sections.condition.join('\n');
+  if (sections.jockey.length)    stats.statsByJockey    = sections.jockey.join('\n');
+  if (sections.trainer.length)   stats.statsByTrainer   = sections.trainer.join('\n');
+
+  info(`  Parsed — career: ${stats.careerStarts}/${stats.careerWins}/${stats.careerSeconds}/${stats.careerThirds} | sire: ${stats.sire || '–'}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -889,7 +871,8 @@ async function main() {
     const formData = await scrapeFormData(page);
     info(`Form data scraped for ${formData.length} horses`);
 
-    info('Starting RacingZone lookups...');
+    info('Starting RacingZone lookups (screenshot + OCR)...');
+    const screenshotDir = path.join(outputPath, 'screenshots');
     const horseStats = [];
     for (let i = 0; i < runners.length; i++) {
       const runner = runners[i];
@@ -898,7 +881,7 @@ async function main() {
         continue;
       }
       info(`[${i + 1}/${runners.length}] RacingZone: ${runner.name}`);
-      horseStats.push(await scrapeRacingZoneHorse(page, runner.name));
+      horseStats.push(await scrapeRacingZoneHorse(page, runner.name, screenshotDir));
       if (i < runners.length - 1) await sleep(args.delayMs);
     }
 
