@@ -627,15 +627,39 @@ function parseRaceRow(line) {
   if (notOdds.length) row.weight = notOdds[0];
 
   // Race timing — RacingZone shows times as decimal seconds (e.g. 97.96, 37.81).
-  // Both are XX.XX or XXX.XX with exactly two decimal places.
-  // Exclude any match preceded by '$' (those are prices, not times).
   // Total race time > 55 s; last-600m split is 30–55 s.
+  //
+  // Pass 1: properly formatted XX.XX / XXX.XX values (decimal point present).
   const timingNums = [...line.matchAll(/\b(\d{2,3}\.\d{2})\b/g)]
     .filter(m => line[m.index - 1] !== '$')
     .map(m => ({ raw: m[1], val: parseFloat(m[1]) }))
     .filter(t => t.val >= 30);
-  const totalTimeEntry = timingNums.find(t => t.val > 55);
-  const last600Entry   = timingNums.find(t => t.val >= 30 && t.val <= 55);
+  let totalTimeEntry = timingNums.find(t => t.val > 55);
+  let last600Entry   = timingNums.find(t => t.val >= 30 && t.val <= 55);
+
+  // Pass 2: OCR sometimes drops the decimal point (3781 instead of 37.81).
+  // Convert XXXX → XX.XX and XXXXX → XXX.XX, then re-classify.
+  // Only runs for whichever values are still missing after pass 1.
+  if (!totalTimeEntry || !last600Entry) {
+    const distInt = row.distance ? parseInt(row.distance) : -1;
+    const intNums = [...line.matchAll(/\b(\d{4,5})\b/g)]
+      .filter(m =>
+        line[m.index - 1] !== '$' &&                        // not a price
+        !/[kKmM]/i.test(line[m.index + m[1].length] || '') // not prize money suffix
+      )
+      .map(m => {
+        const s   = m[1];
+        const raw = s.length === 4
+          ? `${s.slice(0, 2)}.${s.slice(2)}`   // XXXX  → XX.XX
+          : `${s.slice(0, 3)}.${s.slice(3)}`;  // XXXXX → XXX.XX
+        return { raw, val: parseFloat(raw), orig: parseInt(s) };
+      })
+      .filter(t => t.val >= 30 && t.val <= 250 && t.orig !== distInt);
+
+    if (!totalTimeEntry) totalTimeEntry = intNums.find(t => t.val > 55);
+    if (!last600Entry)   last600Entry   = intNums.find(t => t.val >= 30 && t.val <= 55);
+  }
+
   if (totalTimeEntry) row.totalTime = totalTimeEntry.raw;
   if (last600Entry)   row.last600   = last600Entry.raw;
 
