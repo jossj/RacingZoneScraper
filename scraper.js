@@ -325,6 +325,33 @@ async function scrapeFormData(page) {
 // RacingZone
 // ---------------------------------------------------------------------------
 
+async function fillInput(page, selector, value) {
+  // Works for plain HTML and React/Vue controlled inputs.
+  // 1) Click to focus, 2) select-all + delete any existing text,
+  // 3) set value via native setter (triggers React's synthetic onChange),
+  // 4) dispatch real browser events so the framework picks up the change,
+  // 5) type the text character-by-character as a fallback belt-and-suspenders.
+  await page.click(selector);
+  await page.keyboard.down('Control');
+  await page.keyboard.press('KeyA');
+  await page.keyboard.up('Control');
+  await page.keyboard.press('Backspace');
+
+  await page.evaluate((sel, val) => {
+    const el = document.querySelector(sel);
+    if (!el) return;
+    // Native setter bypasses React's read-only descriptor
+    const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    nativeSetter.call(el, val);
+    el.dispatchEvent(new Event('input',  { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+  }, selector, value);
+
+  // Belt-and-suspenders: also physically type it (helps with non-React fields)
+  await page.type(selector, value, { delay: 40 });
+}
+
 async function scrapeRacingZoneHorse(page, horseName) {
   const stats = {
     name: horseName, error: '',
@@ -337,35 +364,75 @@ async function scrapeRacingZoneHorse(page, horseName) {
 
   info(`Searching RacingZone for: ${horseName}`);
   try {
-    await page.goto(RACINGZONE_HORSES_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await sleep(2000);
+    await page.goto(RACINGZONE_HORSES_URL, { waitUntil: 'networkidle2', timeout: 60000 });
 
+    // Candidate selectors in order of specificity — first visible match wins
     const inputSels = [
-      "input[name='horse_name']", "input[name='name']",
-      "input[placeholder*='horse' i]", "input[placeholder*='Find' i]",
-      "input[type='search']", "#horse_name", "#name", "form input[type='text']",
+      "input[name='horse_name']",
+      "input[name='name']",
+      "#horse_name",
+      "#name",
+      "input[placeholder*='horse' i]",
+      "input[placeholder*='Find' i]",
+      "input[placeholder*='Search' i]",
+      "input[type='search']",
+      "form input[type='text']",
+      "input[type='text']",
     ];
-    let input = null;
-    for (const sel of inputSels) {
-      input = await page.$(sel);
-      if (input) break;
-    }
-    if (!input) { stats.error = 'Search input not found'; return stats; }
 
-    await input.click({ clickCount: 3 });
-    await input.type(horseName);
+    let inputSel = null;
+    for (const sel of inputSels) {
+      try {
+        await page.waitForSelector(sel, { visible: true, timeout: 3000 });
+        inputSel = sel;
+        info(`Found search input: ${sel}`);
+        break;
+      } catch { /* try next */ }
+    }
+
+    if (!inputSel) {
+      // Last resort: grab any visible text input on the page
+      inputSel = await page.evaluate(() => {
+        const el = [...document.querySelectorAll('input')]
+          .find(i => i.offsetParent !== null &&
+                     (i.type === 'text' || i.type === 'search' || i.type === ''));
+        if (!el) return null;
+        // Build a unique selector
+        if (el.id)   return `#${el.id}`;
+        if (el.name) return `input[name="${el.name}"]`;
+        return 'input[type="text"]';
+      });
+    }
+
+    if (!inputSel) { stats.error = 'Search input not found'; return stats; }
+
+    await fillInput(page, inputSel, horseName);
     await sleep(500);
 
+    // Verify the value actually landed
+    const actual = await page.$eval(inputSel, el => el.value).catch(() => '');
+    if (!actual) {
+      warn(`Input value empty after fill — retrying with keyboard only`);
+      await page.click(inputSel, { clickCount: 3 });
+      await page.keyboard.type(horseName, { delay: 60 });
+      await sleep(300);
+    }
+
+    info(`Input value confirmed: "${await page.$eval(inputSel, el => el.value).catch(() => '?')}"`);
+
+    // Submit
     const btnSels = [
-      "button[type='submit']", "input[type='submit']",
-      "button[class*='search' i]", "form button",
+      "button[type='submit']",
+      "input[type='submit']",
+      "button[class*='search' i]",
+      "form button",
     ];
     let clicked = false;
     for (const sel of btnSels) {
       const btn = await page.$(sel);
       if (btn) { await btn.click(); clicked = true; break; }
     }
-    if (!clicked) await input.press('Enter');
+    if (!clicked) await page.keyboard.press('Enter');
     await sleep(3000);
 
     // Click best-matching result link
