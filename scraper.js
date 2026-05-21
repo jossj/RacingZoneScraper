@@ -462,6 +462,17 @@ async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
       }
     }
 
+    // Scroll the full page to force lazy-loaded content to render, then back to top.
+    await page.evaluate(async () => {
+      const step = 600;
+      for (let y = 0; y < document.body.scrollHeight; y += step) {
+        window.scrollTo(0, y);
+        await new Promise(r => setTimeout(r, 80));
+      }
+      window.scrollTo(0, 0);
+    });
+    await sleep(1500);
+
     info(`  Taking screenshot and running OCR: ${page.url()}`);
     const ocrText = await screenshotAndOcr(page, horseName, screenshotDir);
     parseOcrText(ocrText, stats);
@@ -511,6 +522,13 @@ async function screenshotAndOcr(page, horseName, screenshotDir) {
     await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
     const { data: { text } } = await worker.recognize(procPath);
     info(`  OCR complete: ${text.length} chars extracted`);
+
+    // Save raw OCR text next to the screenshot — inspect this file if fields
+    // are missing, since it shows exactly what Tesseract read from the page.
+    const txtPath = path.join(screenshotDir, `${safeName}_ocr.txt`);
+    fs.writeFileSync(txtPath, text, 'utf8');
+    info(`  OCR text saved: ${txtPath}`);
+
     return text;
   } finally {
     await worker.terminate();
@@ -567,9 +585,10 @@ function parseRaceRow(line) {
 // Keywords that indicate a race history section on RacingZone (case-insensitive).
 // Deliberately excludes nav-menu phrases like "Form Guide", "Recent Form", "Race Form".
 const HISTORY_HEADINGS = [
-  'race history', 'past runs', 'run history', 'recent runs', 'form history',
-  'last starts', 'race record', 'past performances', 'run record',
+  'race history', 'racing history', 'past runs', 'run history', 'recent runs',
+  'form history', 'last starts', 'race record', 'past performances', 'run record',
   'recent starts', 'race results', 'last runs', 'past starts', 'last performances',
+  'performance history', 'starts history', 'form record', 'runs',
 ];
 
 function parseOcrText(rawText, stats) {
@@ -608,7 +627,8 @@ function parseOcrText(rawText, stats) {
     }
 
     // ── Key: Value pairs (Sire, Dam, Colour, etc.) ──────────────────────────
-    const kv = line.match(/^([A-Za-z][\w &/]+?):\s*(.+)$/);
+    // Also accept semicolons — OCR commonly misreads ':' as ';'.
+    const kv = line.match(/^([A-Za-z][\w &/]+?)[;:]\s*(.+)$/);
     if (kv) {
       const key = kv[1].toLowerCase().trim();
       const val = kv[2].trim();
@@ -624,10 +644,19 @@ function parseOcrText(rawText, stats) {
     }
 
     // ── Career stats row ─────────────────────────────────────────────────────
-    if (lower.includes('career') && !lower.includes('prize')) {
-      const nums  = line.match(/\d[\d,]*/g) || [];
-      const prize = line.match(/\$[\d,]+/);
-      if (nums.length >= 4) {
+    // Handles: "Career: 10 3 2 1", "Career 10-3-2-1", "Overall: 10: 3-2-1 $50,000"
+    const isCareerLine = lower.includes('career') || lower.includes('overall record') || lower.includes('total starts');
+    if (isCareerLine && !lower.includes('prize')) {
+      // Try dash-separated record first: 10-3-2-1
+      const dashRecord = line.match(/\b(\d+)-(\d+)-(\d+)-(\d+)\b/);
+      const nums       = line.match(/\d[\d,]*/g) || [];
+      const prize      = line.match(/\$[\d,]+/);
+      if (dashRecord) {
+        if (!stats.careerStarts)  stats.careerStarts  = dashRecord[1];
+        if (!stats.careerWins)    stats.careerWins    = dashRecord[2];
+        if (!stats.careerSeconds) stats.careerSeconds = dashRecord[3];
+        if (!stats.careerThirds)  stats.careerThirds  = dashRecord[4];
+      } else if (nums.length >= 4) {
         if (!stats.careerStarts)  stats.careerStarts  = nums[0];
         if (!stats.careerWins)    stats.careerWins    = nums[1];
         if (!stats.careerSeconds) stats.careerSeconds = nums[2];
@@ -637,9 +666,17 @@ function parseOcrText(rawText, stats) {
     }
 
     // ── Last 12 months row ──────────────────────────────────────────────────
-    if ((lower.includes('last 12') || lower.includes('l12') || lower.includes('12 month')) && !stats.l12mStarts) {
-      const nums = line.match(/\d[\d,]*/g) || [];
-      if (nums.length >= 4) {
+    const isL12mLine = lower.includes('last 12') || lower.includes('l12') ||
+                       lower.includes('12 month') || lower.includes('past 12');
+    if (isL12mLine && !stats.l12mStarts) {
+      const dashRecord = line.match(/\b(\d+)-(\d+)-(\d+)-(\d+)\b/);
+      const nums       = line.match(/\d[\d,]*/g) || [];
+      if (dashRecord) {
+        stats.l12mStarts  = dashRecord[1];
+        stats.l12mWins    = dashRecord[2];
+        stats.l12mSeconds = dashRecord[3];
+        stats.l12mThirds  = dashRecord[4];
+      } else if (nums.length >= 4) {
         stats.l12mStarts  = nums[0];
         stats.l12mWins    = nums[1];
         stats.l12mSeconds = nums[2];
