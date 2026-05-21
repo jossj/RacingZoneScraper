@@ -1,35 +1,27 @@
 'use strict';
 
-const readline = require('readline');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
-const { chromium, firefox } = require('playwright');
-const ExcelJS = require('exceljs');
+const puppeteer = require('puppeteer');
+const ExcelJS   = require('exceljs');
+const readline  = require('readline');
+const path      = require('path');
+const fs        = require('fs');
+const os        = require('os');
 
 const RACINGZONE_HORSES_URL = 'https://www.racingzone.com.au/statistics/horses/';
-const DEFAULT_OUTPUT = 'C:\\tab\\scrape';
-const DEFAULT_DELAY_MS = 2000;
+const DEFAULT_OUTPUT        = 'C:\\tab\\scrape';
+const DEFAULT_DELAY_MS      = 2000;
 
 // ---------------------------------------------------------------------------
-// CLI args (optional flags only — URL is prompted interactively)
+// CLI args
 // ---------------------------------------------------------------------------
 
 const args = parseArgs(process.argv.slice(2));
 
 function parseArgs(argv) {
-  const opts = {
-    output: DEFAULT_OUTPUT,
-    browser: 'chromium',
-    headless: false,   // always show the browser window
-    delayMs: DEFAULT_DELAY_MS,
-  };
+  const opts = { output: DEFAULT_OUTPUT, delayMs: DEFAULT_DELAY_MS };
   for (let i = 0; i < argv.length; i++) {
-    switch (argv[i]) {
-      case '--output':  opts.output  = argv[++i]; break;
-      case '--browser': opts.browser = argv[++i]; break;
-      case '--delay':   opts.delayMs = Number(argv[++i]) * 1000; break;
-    }
+    if (argv[i] === '--output') opts.output  = argv[++i];
+    if (argv[i] === '--delay')  opts.delayMs = Number(argv[++i]) * 1000;
   }
   return opts;
 }
@@ -38,576 +30,428 @@ function parseArgs(argv) {
 // Logging
 // ---------------------------------------------------------------------------
 
-function log(level, ...parts) {
-  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  console.log(`${ts} [${level}]`, ...parts);
+function ts() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
+const info  = (...a) => console.log(`${ts()} [INFO ]`, ...a);
+const warn  = (...a) => console.log(`${ts()} [WARN ]`, ...a);
+const error = (...a) => console.log(`${ts()} [ERROR]`, ...a);
+
+// ---------------------------------------------------------------------------
+// Prompt
+// ---------------------------------------------------------------------------
+
+function prompt(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans.trim()); }));
 }
-const info  = (...a) => log('INFO ', ...a);
-const warn  = (...a) => log('WARN ', ...a);
-const error = (...a) => log('ERROR', ...a);
-const debug = (...a) => { if (process.env.DEBUG) log('DEBUG', ...a); };
 
-// ---------------------------------------------------------------------------
-// Interactive URL prompt
-// ---------------------------------------------------------------------------
+async function promptForUrl() {
+  console.log('\n' + '='.repeat(60));
+  console.log('  Horse Racing Scraper');
+  console.log('='.repeat(60));
+  console.log('Paste the full URL of the TAB race page and press Enter.');
+  console.log('Example: https://www.tab.com.au/racing/2026-05-18/RANDWICK/NSW/R/1');
+  console.log();
 
-function promptForUrl() {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    console.log('\n' + '='.repeat(60));
-    console.log('  Horse Racing Scraper');
-    console.log('='.repeat(60));
-    console.log('Paste the full URL of the TAB race page and press Enter.');
-    console.log('Example: https://www.tab.com.au/racing/2026-05-18/RANDWICK/NSW/R/1');
-    console.log();
-
-    const ask = () => {
-      rl.question('TAB race URL: ', (answer) => {
-        const url = answer.trim();
-        if (url.startsWith('http')) {
-          rl.close();
-          resolve(url);
-        } else {
-          console.log('  Please enter a valid URL starting with http.');
-          ask();
-        }
-      });
-    };
-    ask();
-  });
+  let url = '';
+  while (!url.startsWith('http')) {
+    url = await prompt('TAB race URL: ');
+    if (!url.startsWith('http')) console.log('  Please enter a valid URL starting with http.');
+  }
+  return url;
 }
 
 // ---------------------------------------------------------------------------
-// Output path helper
+// Output path
 // ---------------------------------------------------------------------------
 
 function resolveOutputPath(raw) {
   if (process.platform === 'win32') return raw;
   const lower = raw.toLowerCase();
   if (lower.startsWith('c:\\') || lower.startsWith('c:/')) {
-    const rest = raw.slice(3).replace(/\\/g, '/');
-    return path.join(os.homedir(), rest);
+    return path.join(os.homedir(), raw.slice(3).replace(/\\/g, '/'));
   }
   return raw.replace(/\\/g, '/');
 }
 
 // ---------------------------------------------------------------------------
-// Browser helpers
+// TAB helpers
 // ---------------------------------------------------------------------------
 
-async function buildBrowser() {
-  const launcher = args.browser === 'firefox' ? firefox : chromium;
-  return launcher.launch({
-    headless: args.headless,
-    args: ['--start-maximized', '--no-first-run', '--no-default-browser-check'],
-  });
-}
-
-async function newPage(browser) {
-  const ctx = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: null,   // respect --start-maximized
-  });
-  const page = await ctx.newPage();
-  page.setDefaultTimeout(15000);
-  return page;
-}
-
-async function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// ---------------------------------------------------------------------------
-// TAB page — wait, cookie banner, Show All Form
-// ---------------------------------------------------------------------------
-
-async function waitForPage(page, timeout = 30000) {
-  info('Waiting for runner list to appear...');
+async function waitForRunners(page, timeout = 30000) {
   await page.waitForSelector('.runner-name', { timeout });
-  info('Page ready.');
-}
-
-async function dismissCookieBanner(page) {
-  try {
-    const btn = page.locator(
-      "[class*='cookie'] button, [id*='cookie'] button, " +
-      "[class*='consent'] button, [id*='consent'] button"
-    ).first();
-    if (await btn.count({ timeout: 3000 }) > 0) {
-      await btn.click();
-      await sleep(1000);
-      info('Cookie banner dismissed.');
-    }
-  } catch { /* no banner — continue */ }
 }
 
 async function clickShowAllForm(page) {
-  // Primary selector — matches the wrapper pattern used on TAB
-  const primary = "[class*='show-all-form'] button, .show-all-form-wrapper button";
+  const sel = "[class*='show-all-form'] button, .show-all-form-wrapper button";
   try {
-    const btn = page.locator(primary).first();
-    await btn.waitFor({ state: 'visible', timeout: 10000 });
-    const label = (await btn.innerText().catch(() => '')).trim();
-    if (label.toLowerCase().includes('hide')) {
+    await page.waitForSelector(sel, { timeout: 10000 });
+    const btn = await page.$(sel);
+    if (btn) {
+      const text = await page.evaluate(el => el.textContent, btn);
+      if (!text.includes('Hide')) {
+        await btn.click();
+        await sleep(4000);
+        info('"Show All Form" expanded.');
+        return;
+      }
       info('Form already expanded — skipping click.');
-      return true;
     }
-    info(`Clicking "${label}" button...`);
-    await btn.click();
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    await sleep(4000);
-    info('"Show All Form" expanded.');
-    return true;
   } catch {
-    warn('"Show All Form" button not found — trying individual expand buttons...');
-    return expandIndividualForms(page);
+    warn('"Show All Form" button not found — trying individual expand buttons.');
+    await expandIndividualForms(page);
   }
 }
 
 async function expandIndividualForms(page) {
   try {
-    const btns = await page.locator(
-      "[class*='form-toggle'] button, [class*='expand-form'] button, " +
-      "[aria-label*='form' i], [aria-label*='Form']"
-    ).all();
+    const btns = await page.$$(
+      "[class*='form-toggle'] button, [class*='expand-form'] button"
+    );
     for (const btn of btns) {
-      const label = (await btn.getAttribute('aria-label').catch(() => '') || '').toLowerCase();
-      const txt   = (await btn.innerText().catch(() => '')).toLowerCase();
-      if (!txt.includes('hide') && !label.includes('hide')) {
-        await btn.evaluate((el) => el.click());
-        await sleep(300);
-      }
+      try {
+        const text = await page.evaluate(el => el.textContent, btn);
+        if (!text.includes('Hide')) {
+          await page.evaluate(el => el.click(), btn);
+          await sleep(300);
+        }
+      } catch { /* ignore */ }
     }
     await sleep(2000);
     info(`Expanded ${btns.length} individual form panels.`);
-    return btns.length > 0;
-  } catch {
-    return false;
-  }
+  } catch { /* ignore */ }
+}
+
+async function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // ---------------------------------------------------------------------------
-// Race info — parsed from URL + page headings
+// Race info
 // ---------------------------------------------------------------------------
 
-function parseRaceInfoFromUrl(url) {
-  const info = { url };
+function parseUrlMeta(url) {
+  const meta = { url };
   // e.g. /racing/2026-05-18/RANDWICK/NSW/R/3
   const m = url.match(/racing\/(\d{4}-\d{2}-\d{2})\/([A-Z0-9_-]+)\/[A-Z]+\/[RGH]\/(\d+)/i);
-  if (m) {
-    info.date     = m[1];
-    info.venue    = m[2].replace(/-/g, ' ');
-    info.raceNum  = m[3];
-  }
-  return info;
+  if (m) { meta.date = m[1]; meta.venue = m[2].replace(/-/g, ' '); meta.raceNum = m[3]; }
+  return meta;
 }
 
-async function getRaceInfo(page, url) {
-  const raceInfo = parseRaceInfoFromUrl(url);
+async function getRaceInfo(page) {
+  const url  = page.url();
+  const meta = parseUrlMeta(url);
 
-  // Race name from page headings
-  try {
-    const headings = await page.locator('h1, h2, h3, h4').all();
-    for (const h of headings) {
-      const t = (await h.innerText().catch(() => '')).trim();
+  Object.assign(meta, await page.evaluate(() => {
+    const result = { raceName: '', bannerDetails: '', trackCondition: '' };
+
+    // Race name
+    for (const h of document.querySelectorAll('h1,h2,h3,h4')) {
+      const t = h.textContent.trim();
       if (t.length > 5 && !/TAB|Racing/i.test(t)) {
-        raceInfo.raceName = t.replace(/\s*-\s*Betting Odds$/i, '').trim();
+        result.raceName = t.replace(/\s*-\s*Betting Odds$/i, '').trim();
         break;
       }
     }
-  } catch { raceInfo.raceName = ''; }
 
-  // Banner details (distance, grade, prize money)
-  try {
-    const items = await page.locator(
+    // Banner
+    result.bannerDetails = [...document.querySelectorAll(
       "banner li, [class*='race-info'] li, [class*='race-detail'] li"
-    ).all();
-    const texts = [];
-    for (const el of items) {
-      const t = (await el.innerText().catch(() => '')).trim();
-      if (t) texts.push(t);
-    }
-    raceInfo.bannerDetails = texts.slice(0, 10).join(' | ');
-  } catch { raceInfo.bannerDetails = ''; }
+    )].map(e => e.textContent.trim()).filter(Boolean).slice(0, 10).join(' | ');
 
-  // Track condition
-  try {
-    const conds = await page.locator("[class*='track-condition'], [class*='condition']").all();
-    const parts = [];
-    for (const c of conds) {
-      const t = (await c.innerText().catch(() => '')).trim();
-      if (t) parts.push(t);
-    }
-    raceInfo.trackCondition = parts.join(' ');
-  } catch { raceInfo.trackCondition = ''; }
+    // Track condition
+    result.trackCondition = [...document.querySelectorAll(
+      "[class*='track-condition'], [class*='condition']"
+    )].map(e => e.textContent.trim()).filter(Boolean).join(' ');
 
-  return raceInfo;
+    return result;
+  }));
+
+  return meta;
 }
 
 // ---------------------------------------------------------------------------
-// Runners — uses the real TAB CSS classes from greyhoundracing.py
+// Runners
 // ---------------------------------------------------------------------------
 
 async function scrapeRunners(page) {
-  const runners = [];
+  return page.evaluate(() => {
+    const rows = [...document.querySelectorAll('.row')]
+      .filter(r => r.querySelector('.runner-name'));
 
-  // All rows that contain a .runner-name element
-  const allRows = await page.locator('.row').all();
-  const runnerRows = [];
-  for (const row of allRows) {
-    if (await row.locator('.runner-name').count() > 0) runnerRows.push(row);
-  }
+    return rows.map(row => {
+      // Number / cloth
+      const numEl = row.querySelector('.number-cell, [class*="number"], [class*="silk"]');
+      const number = numEl ? numEl.textContent.trim() : '';
 
-  info(`Found ${runnerRows.length} runner rows`);
+      // Horse name — strip nested span text
+      let name = '';
+      const nameEl = row.querySelector('.runner-name');
+      if (nameEl) {
+        const nested = [...nameEl.querySelectorAll('span, .barrier, .box')]
+          .map(n => n.textContent).join('');
+        name = nameEl.textContent.replace(nested, '').trim();
+      }
 
-  for (const row of runnerRows) {
-    const r = {
-      number: '', name: '', jockey: '', trainer: '',
-      form: '', weight: '', rating: '',
-      winOdds: '', placeOdds: '', toteWin: '', totePlace: '',
-      scratched: false,
-    };
+      // Jockey + Trainer
+      const fullNames = [...row.querySelectorAll('.runner-metadata-list .full-name')];
+      const jockey  = fullNames[0] ? fullNames[0].textContent.trim() : '';
+      const trainer = fullNames[1] ? fullNames[1].textContent.trim() : '';
 
-    // Runner number / barrier (horses use cloth number)
-    try {
-      r.number = (await row.locator(
-        '.number-cell, [class*="number"], [class*="silk"]'
-      ).first().innerText({ timeout: 1000 })).trim();
-    } catch { /* fine */ }
-
-    // Horse name — strip any nested span text
-    try {
-      const nameEl = row.locator('.runner-name').first();
-      const nameRaw = await nameEl.innerText({ timeout: 2000 });
-      const nested = await nameEl.locator('span, .barrier, .box').allInnerTexts();
-      let name = nameRaw;
-      for (const n of nested) name = name.replace(n, '');
-      r.name = name.trim();
-    } catch { /* skip row */ }
-
-    if (!r.name) continue;
-
-    // Jockey + Trainer from metadata list full-name elements
-    try {
-      const fullNames = await row.locator('.runner-metadata-list .full-name').allInnerTexts();
-      r.jockey  = (fullNames[0] || '').trim();
-      r.trainer = (fullNames[1] || '').trim();
-    } catch { /* fine */ }
-
-    // Form / Weight / Rating from optional metadata dt→dd pairs
-    try {
-      const dts = await row.locator('.runner-metadata-list.optional dt').allInnerTexts();
-      const dds = await row.locator('.runner-metadata-list.optional dd').allInnerTexts();
+      // Form / Weight / Rating
+      const dts = [...row.querySelectorAll('.runner-metadata-list.optional dt')];
+      const dds = [...row.querySelectorAll('.runner-metadata-list.optional dd')];
       const meta = {};
-      dts.forEach((k, i) => { meta[k.trim()] = (dds[i] || '').trim(); });
-      r.form   = meta['F'] || meta['Form'] || '';
-      r.weight = meta['W'] || meta['Weight'] || '';
-      r.rating = meta['R'] || meta['Rating'] || '';
-    } catch { /* fine */ }
+      dts.forEach((k, i) => { if (dds[i]) meta[k.textContent.trim()] = dds[i].textContent.trim(); });
 
-    // Odds from price cells
-    try {
-      const prices = await row.locator('.price-cell').allInnerTexts();
-      r.winOdds   = (prices[0] || '').trim();
-      r.placeOdds = (prices[1] || '').trim();
-      r.toteWin   = (prices[2] || '').trim();
-      r.totePlace = (prices[3] || '').trim();
-    } catch { /* fine */ }
+      // Odds
+      const prices = [...row.querySelectorAll('.price-cell')].map(p => p.textContent.trim());
 
-    r.scratched = [r.winOdds, r.placeOdds].join(' ').includes('SCR');
+      const winOdds   = prices[0] || '';
+      const placeOdds = prices[1] || '';
 
-    runners.push(r);
-  }
-
-  return runners;
+      return {
+        number, name, jockey, trainer,
+        form:       meta['F'] || '',
+        weight:     meta['W'] || '',
+        rating:     meta['R'] || '',
+        winOdds,
+        placeOdds,
+        toteWin:    prices[2] || '',
+        totePlace:  prices[3] || '',
+        scratched:  (winOdds + ' ' + placeOdds).includes('SCR'),
+      };
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
-// Form data — expanded panels after "Show All Form" click
+// Form data (expanded panels)
 // ---------------------------------------------------------------------------
-
-function findVal(liTexts, key) {
-  for (const t of liTexts) {
-    if (t.startsWith(key)) return t.slice(key.length).trim();
-  }
-  return '';
-}
 
 async function scrapeFormData(page) {
-  const formData = [];
+  return page.evaluate(() => {
+    const formRows = [...document.querySelectorAll('.row.form')];
 
-  // Form rows sit after each runner row and carry class .row.form
-  const formRows = await page.locator('.row.form').all();
-  info(`Found ${formRows.length} expanded form panels`);
+    return formRows.map(formRow => {
+      const wrapper = formRow.querySelector('.form-data-wrapper');
+      if (!wrapper) return null;
 
-  for (const formRow of formRows) {
-    let wrapper;
-    try {
-      wrapper = formRow.locator('.form-data-wrapper').first();
-      await wrapper.waitFor({ state: 'attached', timeout: 3000 });
-    } catch { continue; }
+      // Horse name from preceding sibling runner row
+      let name = 'Unknown';
+      let el = formRow.previousElementSibling;
+      while (el && !el.querySelector('.runner-name')) el = el.previousElementSibling;
+      if (el) name = el.querySelector('.runner-name').textContent.trim();
 
-    const dog = { name: '', profile: {}, conditionStats: {}, raceHistory: [] };
+      // li text helper
+      const liTexts = [...wrapper.querySelectorAll('li')]
+        .map(li => li.textContent.trim()).filter(Boolean);
+      const findVal = key => {
+        const item = liTexts.find(t => t.startsWith(key));
+        return item ? item.slice(key.length).trim() : '';
+      };
 
-    // Resolve the horse name from the preceding sibling runner row
-    try {
-      dog.name = await page.evaluate((el) => {
-        let sib = el.previousElementSibling;
-        while (sib) {
-          const n = sib.querySelector('.runner-name');
-          if (n) return n.textContent.trim();
-          sib = sib.previousElementSibling;
-        }
-        return '';
-      }, await formRow.elementHandle());
-    } catch { dog.name = 'Unknown'; }
-
-    // Profile fields from li elements inside the wrapper
-    try {
-      const liTexts = await wrapper.locator('li').allInnerTexts();
-      const trimmed = liTexts.map((t) => t.trim()).filter(Boolean);
-
-      const winsItem   = trimmed.find((t) => t.includes('Wins') && t.includes('%')) || '';
-      const placesItem = trimmed.find((t) => t.includes('Places') && t.includes('%')) || '';
-      const winsPct    = (winsItem.match(/(\d+)%/) || [])[1];
+      const winsItem   = liTexts.find(t => t.includes('Wins')   && t.includes('%')) || '';
+      const placesItem = liTexts.find(t => t.includes('Places') && t.includes('%')) || '';
+      const winsPct    = (winsItem.match(/(\d+)%/)   || [])[1];
       const placesPct  = (placesItem.match(/(\d+)%/) || [])[1];
 
-      dog.profile = {
-        career:     findVal(trimmed, 'Career '),
-        prizeMoney: findVal(trimmed, 'Prize Money '),
-        sire:       findVal(trimmed, 'Sire '),
-        dam:        findVal(trimmed, 'Dam '),
-        colour:     findVal(trimmed, 'Colour '),
-        sex:        findVal(trimmed, 'Sex '),
-        age:        findVal(trimmed, 'Age '),
-        trainer:    findVal(trimmed, 'Trainer '),
-        jockey:     findVal(trimmed, 'Jockey '),
-        owner:      findVal(trimmed, 'Owner '),
-        lastRun:    findVal(trimmed, 'Last Run '),
-        winsPct:    winsPct  ? winsPct  + '%' : '',
+      const profile = {
+        career:     findVal('Career '),
+        prizeMoney: findVal('Prize Money '),
+        sire:       findVal('Sire '),
+        dam:        findVal('Dam '),
+        colour:     findVal('Colour '),
+        sex:        findVal('Sex '),
+        age:        findVal('Age '),
+        trainer:    findVal('Trainer '),
+        jockey:     findVal('Jockey '),
+        owner:      findVal('Owner '),
+        lastRun:    findVal('Last Run '),
+        winsPct:    winsPct   ? winsPct   + '%' : '',
         placesPct:  placesPct ? placesPct + '%' : '',
       };
 
-      dog.conditionStats = {
-        track:    findVal(trimmed, 'Track '),
-        distance: findVal(trimmed, 'Distance '),
-        trkDist:  findVal(trimmed, 'Trk & Dist '),
-        firm:     findVal(trimmed, 'Firm '),
-        good:     findVal(trimmed, 'Good '),
-        soft:     findVal(trimmed, 'Soft '),
-        heavy:    findVal(trimmed, 'Heavy '),
-        barrier:  findVal(trimmed, 'Barrier '),
-        firstUp:  findVal(trimmed, '1st Up '),
-        secondUp: findVal(trimmed, '2nd Up '),
-        thirdUp:  findVal(trimmed, '3rd Up '),
+      const conditionStats = {
+        track:    findVal('Track '),
+        distance: findVal('Distance '),
+        trkDist:  findVal('Trk & Dist '),
+        firm:     findVal('Firm '),
+        good:     findVal('Good '),
+        soft:     findVal('Soft '),
+        heavy:    findVal('Heavy '),
+        barrier:  findVal('Barrier '),
+        firstUp:  findVal('1st Up '),
+        secondUp: findVal('2nd Up '),
+        thirdUp:  findVal('3rd Up '),
       };
-    } catch (e) {
-      warn(`Error scraping profile for ${dog.name}: ${e.message}`);
-    }
 
-    // Race history from flexible row cells
-    try {
-      const bodyWrapper = wrapper.locator('.flexible-body-wrapper').first();
-      const bodyRows = await bodyWrapper.locator('.flexible-row').all();
-
-      for (const bRow of bodyRows) {
-        // Spell / break row
-        const spellEl = bRow.locator('.runner-spell .message');
-        if (await spellEl.count() > 0) {
-          dog.raceHistory.push({
-            type: 'spell',
-            message: (await spellEl.innerText().catch(() => '')).trim(),
-          });
-          continue;
-        }
-
-        const cells = await bRow.locator('.flexible-cell').allInnerTexts();
-        const c = cells.map((s) => s.trim());
-        if (c.length >= 8 && (c[0] || c[2])) {
-          dog.raceHistory.push({
-            type:      'race',
-            placing:   c[0]  || '',
-            venue:     c[1]  || '',
-            date:      c[2]  || '',
-            class:     c[3]  || '',
-            distance:  c[4]  || '',
-            weight:    c[5]  || '',
-            barrier:   c[6]  || '',
-            odds:      c[7]  || '',
-            winner2nd: c[8]  || '',
-            margin:    c[9]  || '',
-            time:      c[10] || '',
-            inRun:     c[11] || '',
-          });
+      // Race history
+      const raceHistory = [];
+      const bodyWrapper = wrapper.querySelector('.flexible-body-wrapper');
+      if (bodyWrapper) {
+        for (const bRow of bodyWrapper.querySelectorAll('.flexible-row')) {
+          const spellEl = bRow.querySelector('.runner-spell .message');
+          if (spellEl) {
+            raceHistory.push({ type: 'spell', message: spellEl.textContent.trim() });
+            continue;
+          }
+          const cells = [...bRow.querySelectorAll('.flexible-cell')].map(c => c.textContent.trim());
+          if (cells.length >= 8 && (cells[0] || cells[2])) {
+            raceHistory.push({
+              type:      'race',
+              placing:   cells[0]  || '',
+              venue:     cells[1]  || '',
+              date:      cells[2]  || '',
+              class:     cells[3]  || '',
+              distance:  cells[4]  || '',
+              weight:    cells[5]  || '',
+              barrier:   cells[6]  || '',
+              odds:      cells[7]  || '',
+              winner2nd: cells[8]  || '',
+              margin:    cells[9]  || '',
+              time:      cells[10] || '',
+              inRun:     cells[11] || '',
+            });
+          }
         }
       }
-    } catch (e) {
-      warn(`Error scraping race history for ${dog.name}: ${e.message}`);
-    }
 
-    formData.push(dog);
-  }
-
-  return formData;
+      return { name, profile, conditionStats, raceHistory };
+    }).filter(Boolean);
+  });
 }
 
 // ---------------------------------------------------------------------------
-// RacingZone scraper
+// RacingZone
 // ---------------------------------------------------------------------------
 
 async function scrapeRacingZoneHorse(page, horseName) {
   const stats = {
-    name: horseName, sire: '', dam: '', colour: '', sex: '', age: '',
-    country: '', owner: '', breeder: '',
+    name: horseName, error: '',
     careerStarts: '', careerWins: '', careerSeconds: '', careerThirds: '',
     careerWinPct: '', careerPlacePct: '', careerPrizeMoney: '',
     l12mStarts: '', l12mWins: '', l12mSeconds: '', l12mThirds: '',
     statsByDistance: '', statsByCondition: '', statsByTrackType: '',
     statsByJockey: '', statsByTrainer: '',
-    error: '',
   };
 
   info(`Searching RacingZone for: ${horseName}`);
-
   try {
     await page.goto(RACINGZONE_HORSES_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await sleep(2000);
 
-    const inputSelectors = [
+    const inputSels = [
       "input[name='horse_name']", "input[name='name']",
       "input[placeholder*='horse' i]", "input[placeholder*='Find' i]",
       "input[type='search']", "#horse_name", "#name", "form input[type='text']",
     ];
-
-    let searchInput = null;
-    for (const sel of inputSelectors) {
-      const el = page.locator(sel).first();
-      if (await el.count() > 0) { searchInput = el; break; }
+    let input = null;
+    for (const sel of inputSels) {
+      input = await page.$(sel);
+      if (input) break;
     }
+    if (!input) { stats.error = 'Search input not found'; return stats; }
 
-    if (!searchInput) {
-      stats.error = 'Search input not found';
-      return stats;
-    }
-
-    await searchInput.fill(horseName);
+    await input.click({ clickCount: 3 });
+    await input.type(horseName);
     await sleep(500);
 
-    const btnSelectors = [
+    const btnSels = [
       "button[type='submit']", "input[type='submit']",
-      "button[class*='search' i]", "form button", "[class*='search-btn' i]",
+      "button[class*='search' i]", "form button",
     ];
-    let submitted = false;
-    for (const sel of btnSelectors) {
-      const btn = page.locator(sel).first();
-      if (await btn.count() > 0) { await btn.click(); submitted = true; break; }
+    let clicked = false;
+    for (const sel of btnSels) {
+      const btn = await page.$(sel);
+      if (btn) { await btn.click(); clicked = true; break; }
     }
-    if (!submitted) await searchInput.press('Enter');
-
+    if (!clicked) await input.press('Enter');
     await sleep(3000);
 
-    const resultLinks = await page.locator(
-      '[class*="result"] a, table a, main a, #content a, .content a'
-    ).all();
-
-    if (resultLinks.length) {
-      const nameLower = horseName.toLowerCase();
-      let clicked = false;
-      for (const link of resultLinks) {
-        const txt = (await link.innerText().catch(() => '')).toLowerCase();
-        if (txt.includes(nameLower) || nameLower.includes(txt)) {
+    // Click best-matching result link
+    const links = await page.$$('[class*="result"] a, table a, main a, #content a');
+    if (links.length) {
+      const nl = horseName.toLowerCase();
+      let found = false;
+      for (const link of links) {
+        const txt = (await page.evaluate(el => el.textContent, link)).toLowerCase();
+        if (txt.includes(nl) || nl.includes(txt)) {
           await link.click();
-          clicked = true;
+          found = true;
           await sleep(3000);
           break;
         }
       }
-      if (!clicked) { await resultLinks[0].click(); await sleep(3000); }
+      if (!found) { await links[0].click(); await sleep(3000); }
     }
 
     await parseHorseStatsPage(page, stats);
-
   } catch (err) {
     error(`RacingZone error for ${horseName}:`, err.message);
     stats.error = err.message.slice(0, 200);
   }
-
   return stats;
 }
 
 async function parseHorseStatsPage(page, stats) {
-  const pageText = await page.locator('body').innerText().catch(() => '');
+  const pageText = await page.evaluate(() => document.body.innerText);
   if (!pageText.trim()) { stats.error = 'Empty page'; return; }
 
-  const detailMap = {
-    sire:    ['sire', 'father'],
-    dam:     ['dam', 'mother'],
-    colour:  ['colour', 'color'],
-    sex:     ['sex', 'gender'],
-    age:     ['age'],
-    country: ['country', 'origin'],
-    owner:   ['owner'],
-    breeder: ['breeder'],
-  };
+  await page.evaluate((s) => {
+    const detailMap = {
+      sire:    ['sire', 'father'],
+      dam:     ['dam', 'mother'],
+      colour:  ['colour', 'color'],
+      sex:     ['sex', 'gender'],
+      age:     ['age'],
+      country: ['country', 'origin'],
+      owner:   ['owner'],
+      breeder: ['breeder'],
+    };
 
-  const tables = await page.locator('table').all();
-  for (const tbl of tables) {
-    for (const row of await tbl.locator('tr').all()) {
-      const cells = await row.locator('td, th').all();
-      if (cells.length < 2) continue;
-      const label = (await cells[0].innerText().catch(() => '')).toLowerCase().replace(/:$/, '');
-      const value = (await cells[1].innerText().catch(() => '')).trim();
+    for (const tbl of document.querySelectorAll('table')) {
+      for (const row of tbl.querySelectorAll('tr')) {
+        const cells = [...row.querySelectorAll('td, th')];
+        if (cells.length < 2) continue;
+        const label = cells[0].textContent.toLowerCase().replace(/:$/, '');
+        const value = cells[1].textContent.trim();
+        for (const [attr, kws] of Object.entries(detailMap)) {
+          if (kws.some(kw => label.includes(kw))) { s[attr] = value; break; }
+        }
+      }
+    }
+
+    const dts = [...document.querySelectorAll('dt')];
+    const dds = [...document.querySelectorAll('dd')];
+    for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
+      const label = dts[i].textContent.toLowerCase().replace(/:$/, '');
+      const value = dds[i].textContent.trim();
       for (const [attr, kws] of Object.entries(detailMap)) {
-        if (kws.some((kw) => label.includes(kw))) { stats[attr] = value; break; }
+        if (kws.some(kw => label.includes(kw))) { s[attr] = value; break; }
       }
     }
-  }
 
-  const dts = await page.locator('dt').allInnerTexts();
-  const dds = await page.locator('dd').allInnerTexts();
-  for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
-    const label = dts[i].toLowerCase().replace(/:$/, '');
-    const value = dds[i].trim();
-    for (const [attr, kws] of Object.entries(detailMap)) {
-      if (kws.some((kw) => label.includes(kw))) { stats[attr] = value; break; }
-    }
-  }
+    return s;
+  }, stats);
 
-  for (const tbl of tables) {
-    const headers = await tbl.locator('th').allInnerTexts();
-    const hdrs = headers.map((h) => h.toLowerCase());
+  // Stats tables
+  const tableData = await page.evaluate(() => {
+    return [...document.querySelectorAll('table')].map(tbl => ({
+      headers: [...tbl.querySelectorAll('th')].map(h => h.textContent.toLowerCase()),
+      rows: [...(tbl.querySelector('tbody') ? tbl.querySelectorAll('tbody tr') : [...tbl.querySelectorAll('tr')].slice(1))].map(row =>
+        [...row.querySelectorAll('td')].map(td => td.textContent.trim())
+      ),
+    }));
+  });
 
-    let dataRows = await tbl.locator('tbody tr').all();
-    if (!dataRows.length) dataRows = (await tbl.locator('tr').all()).slice(1);
-
-    for (const row of dataRows) {
-      const cells = await row.locator('td').allInnerTexts();
+  for (const { headers, rows } of tableData) {
+    for (const cells of rows) {
       if (!cells.length) continue;
-      const rowLabel = cells[0].toLowerCase();
-
-      if (rowLabel.includes('career') || rowLabel.includes('total') || rowLabel.includes('all')) {
-        fillStats(stats, cells, hdrs, 'career');
-      } else if (rowLabel.includes('12') || rowLabel.includes('l12') || rowLabel.includes('year')) {
-        fillStats(stats, cells, hdrs, 'l12m');
-      }
-    }
-  }
-
-  const sectionKeywords = {
-    statsByDistance:  ['distance', 'dist'],
-    statsByCondition: ['condition', 'going'],
-    statsByTrackType: ['track type', 'surface'],
-    statsByJockey:    ['jockey'],
-    statsByTrainer:   ['trainer'],
-  };
-  for (const sec of await page.locator('section, [class*="section"], [class*="stats-group"]').all()) {
-    const txt   = (await sec.innerText().catch(() => '')).trim();
-    const lower = txt.toLowerCase();
-    for (const [attr, kws] of Object.entries(sectionKeywords)) {
-      if (!stats[attr] && kws.some((kw) => lower.includes(kw))) {
-        stats[attr] = txt.slice(0, 2000);
+      const label = cells[0].toLowerCase();
+      if (label.includes('career') || label.includes('total') || label.includes('all')) {
+        fillStats(stats, cells, headers, 'career');
+      } else if (label.includes('12') || label.includes('l12') || label.includes('year')) {
+        fillStats(stats, cells, headers, 'l12m');
       }
     }
   }
@@ -617,7 +461,7 @@ function fillStats(stats, cells, headers, prefix) {
   const mapping = {
     start: `${prefix}Starts`, win: `${prefix}Wins`,
     '2nd': `${prefix}Seconds`, second: `${prefix}Seconds`,
-    '3rd': `${prefix}Thirds`,  third:  `${prefix}Thirds`,
+    '3rd': `${prefix}Thirds`,  third: `${prefix}Thirds`,
     'win%': `${prefix}WinPct`, 'place%': `${prefix}PlacePct`,
     prize: `${prefix}PrizeMoney`, earning: `${prefix}PrizeMoney`,
   };
@@ -630,302 +474,233 @@ function fillStats(stats, cells, headers, prefix) {
 }
 
 // ---------------------------------------------------------------------------
-// Excel export
+// Excel colours / style helpers  (matches greyhoundracing/index.js palette)
 // ---------------------------------------------------------------------------
 
-const HEADER_COLOR = 'FF1B5E20';   // dark green (matches greyhoundracing.py)
-const SECTION_COLOR = 'FF388E3C';  // mid green
-const SPELL_COLOR = 'FFFFE699';    // yellow
-const ALT_COLOR = 'FFE8F5E9';      // light green
+const HEADER_BG  = 'FF1B5E20';
+const SECTION_BG = 'FF388E3C';
+const ALT_BG     = 'FFE8F5E9';
+const SPELL_BG   = 'FFFFE699';
+const SPELL_FG   = 'FF7F4F00';
+const WHITE      = 'FFFFFFFF';
+const GREY_TEXT  = 'FF999999';
 
-function styleHeader(ws) {
-  const row = ws.getRow(1);
+const thinBorder = {
+  top: { style: 'thin' }, left: { style: 'thin' },
+  bottom: { style: 'thin' }, right: { style: 'thin' },
+};
+
+function styleHeader(row, numCols) {
+  for (let c = 1; c <= numCols; c++) {
+    const cell = row.getCell(c);
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_BG } };
+    cell.font      = { color: { argb: WHITE }, bold: true };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    cell.border    = thinBorder;
+  }
   row.height = 22;
-  row.eachCell((cell) => {
-    cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_COLOR } };
-    cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-    cell.border = thinBorder();
-  });
 }
 
-function thinBorder() {
-  const s = { style: 'thin' };
-  return { left: s, right: s, top: s, bottom: s };
-}
-
-function styleDataRow(ws, rowNum, alt = false) {
-  const row = ws.getRow(rowNum);
-  row.eachCell({ includeEmpty: true }, (cell) => {
-    cell.fill = {
-      type: 'pattern', pattern: 'solid',
-      fgColor: { argb: alt ? ALT_COLOR : 'FFFFFFFF' },
-    };
-    cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
-    cell.border = thinBorder();
-  });
-}
-
-function styleSectionRow(ws, rowNum, colCount) {
-  for (let c = 1; c <= colCount; c++) {
-    const cell = ws.getCell(rowNum, c);
-    cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: SECTION_COLOR } };
-    cell.alignment = { vertical: 'middle', horizontal: 'left' };
-    cell.border = thinBorder();
+function styleSection(row, numCols) {
+  for (let c = 1; c <= numCols; c++) {
+    const cell = row.getCell(c);
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: SECTION_BG } };
+    cell.font      = { color: { argb: WHITE }, bold: true };
+    cell.alignment = { horizontal: 'left', vertical: 'middle' };
+    cell.border    = thinBorder;
   }
 }
 
-function styleSpellRow(ws, rowNum, colCount) {
-  for (let c = 1; c <= colCount; c++) {
-    const cell = ws.getCell(rowNum, c);
-    cell.font = { bold: true, italic: true, color: { argb: 'FF7F4F00' } };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: SPELL_COLOR } };
-    cell.alignment = { vertical: 'middle', horizontal: 'center' };
-    cell.border = thinBorder();
+function styleData(row, numCols, alternate = false) {
+  const bg = alternate ? ALT_BG : 'FFFFFFFF';
+  for (let c = 1; c <= numCols; c++) {
+    const cell = row.getCell(c);
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } };
+    cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+    cell.border    = thinBorder;
+  }
+}
+
+function styleSpell(row, numCols) {
+  for (let c = 1; c <= numCols; c++) {
+    const cell = row.getCell(c);
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: SPELL_BG } };
+    cell.font      = { color: { argb: SPELL_FG }, bold: true, italic: true };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    cell.border    = thinBorder;
   }
 }
 
 function autoWidth(ws, min = 8, max = 40) {
-  ws.columns.forEach((col) => {
+  ws.columns.forEach(col => {
     let maxLen = 0;
-    col.eachCell({ includeEmpty: true }, (cell) => {
-      const v = cell.value ? String(cell.value) : '';
-      maxLen = Math.max(maxLen, v.length);
+    col.eachCell({ includeEmpty: false }, cell => {
+      const len = cell.value ? String(cell.value).length : 0;
+      if (len > maxLen) maxLen = len;
     });
     col.width = Math.min(Math.max(maxLen + 2, min), max);
   });
 }
 
+// ---------------------------------------------------------------------------
+// Excel export
+// ---------------------------------------------------------------------------
+
 async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) {
   fs.mkdirSync(outputPath, { recursive: true });
 
   const safeVenue = (raceInfo.venue || 'Unknown').replace(/[^a-zA-Z0-9 _-]/g, '_');
-  const dateStr   = (raceInfo.date || new Date().toISOString().slice(0, 10)).replace(/-/g, '');
+  const dateStr   = (raceInfo.date  || new Date().toISOString().slice(0, 10)).replace(/-/g, '');
   const filename  = `TAB_${safeVenue}_R${raceInfo.raceNum || '0'}_${dateStr}.xlsx`.replace(/\s+/g, '_');
   const filepath  = path.join(outputPath, filename);
 
   info('Saving Excel:', filepath);
-
   const wb = new ExcelJS.Workbook();
-  wb.creator = 'RacingZoneScraper';
-  wb.created = new Date();
 
-  // ── Sheet 1: Race Info ────────────────────────────────────────────────────
+  const stripNum = name => name.replace(/\s*\(\d+\)\s*$/, '').trim();
+
+  // ── Sheet 1: Race Info ──────────────────────────────────────────────────
   const ws1 = wb.addWorksheet('Race Info');
-  ws1.columns = [
-    { header: 'Field', key: 'field', width: 20 },
-    { header: 'Value', key: 'value', width: 50 },
-  ];
-  styleHeader(ws1);
-  ws1.views = [{ state: 'frozen', ySplit: 1 }];
-
-  const infoRows = [
-    ['Race Name',       raceInfo.raceName || ''],
-    ['Date',            raceInfo.date     || ''],
-    ['Venue',           raceInfo.venue    || ''],
-    ['Race Number',     raceInfo.raceNum  || ''],
+  ws1.views = [{ state: 'frozen', ySplit: 1, xSplit: 1 }];
+  ws1.columns = [{ width: 20 }, { width: 50 }];
+  styleHeader(ws1.addRow(['Field', 'Value']), 2);
+  [
+    ['Race Name',       raceInfo.raceName       || ''],
+    ['Date',            raceInfo.date           || ''],
+    ['Venue',           raceInfo.venue          || ''],
+    ['Race Number',     raceInfo.raceNum        || ''],
     ['Track Condition', raceInfo.trackCondition || ''],
     ['Banner Details',  raceInfo.bannerDetails  || ''],
-    ['URL',             raceInfo.url || ''],
-    ['Scraped At',      new Date().toLocaleString()],
-  ];
-  infoRows.forEach(([field, value], i) => {
-    ws1.addRow({ field, value });
-    styleDataRow(ws1, i + 2, i % 2 === 1);
-  });
-  autoWidth(ws1);
+    ['URL',             raceInfo.url            || ''],
+    ['Scraped At',      new Date().toISOString().replace('T', ' ').slice(0, 19)],
+  ].forEach(([k, v], i) => styleData(ws1.addRow([k, v]), 2, i % 2 === 1));
 
-  // ── Sheet 2: Runners (TAB) ────────────────────────────────────────────────
+  // ── Sheet 2: Runners ───────────────────────────────────────────────────
   const ws2 = wb.addWorksheet('Runners (TAB)');
-  ws2.columns = [
-    { header: 'No.',        key: 'number',    width: 8  },
-    { header: 'Horse',      key: 'name',      width: 25 },
-    { header: 'Jockey',     key: 'jockey',    width: 22 },
-    { header: 'Trainer',    key: 'trainer',   width: 22 },
-    { header: 'Form',       key: 'form',      width: 14 },
-    { header: 'Weight',     key: 'weight',    width: 10 },
-    { header: 'Rating',     key: 'rating',    width: 10 },
-    { header: 'FO Win',     key: 'winOdds',   width: 10 },
-    { header: 'FO Place',   key: 'placeOdds', width: 10 },
-    { header: 'Tote Win',   key: 'toteWin',   width: 10 },
-    { header: 'Tote Place', key: 'totePlace', width: 10 },
-    { header: 'Scratched',  key: 'scratched', width: 10 },
-  ];
-  styleHeader(ws2);
   ws2.views = [{ state: 'frozen', ySplit: 1 }];
-
+  const runnerCols = [
+    'No.', 'Horse', 'Jockey', 'Trainer', 'Form', 'Weight', 'Rating',
+    'FO Win', 'FO Place', 'Tote Win', 'Tote Place', 'Scratched',
+  ];
+  styleHeader(ws2.addRow(runnerCols), runnerCols.length);
   runners.forEach((r, i) => {
-    ws2.addRow({ ...r, scratched: r.scratched ? 'Yes' : 'No' });
-    styleDataRow(ws2, i + 2, i % 2 === 1);
+    const row = ws2.addRow([
+      r.number, r.name, r.jockey, r.trainer, r.form, r.weight, r.rating,
+      r.winOdds, r.placeOdds, r.toteWin, r.totePlace,
+      r.scratched ? 'Yes' : 'No',
+    ]);
+    styleData(row, runnerCols.length, i % 2 === 1);
     if (r.scratched) {
-      ws2.getRow(i + 2).eachCell((cell) => {
-        cell.font = { italic: true, color: { argb: 'FF999999' } };
-      });
+      for (let c = 1; c <= runnerCols.length; c++)
+        row.getCell(c).font = { color: { argb: GREY_TEXT }, italic: true };
     }
   });
   autoWidth(ws2);
 
-  // ── Sheet 3: Horse Profiles ───────────────────────────────────────────────
+  // ── Sheet 3: Horse Profiles ────────────────────────────────────────────
   const ws3 = wb.addWorksheet('Horse Profiles');
-  ws3.columns = [
-    { header: 'No.',         key: 'number',    width: 8  },
-    { header: 'Horse',       key: 'name',      width: 25 },
-    { header: 'Career',      key: 'career',    width: 18 },
-    { header: 'Prize Money', key: 'prize',     width: 14 },
-    { header: 'Sire',        key: 'sire',      width: 20 },
-    { header: 'Dam',         key: 'dam',       width: 20 },
-    { header: 'Colour',      key: 'colour',    width: 12 },
-    { header: 'Sex',         key: 'sex',       width: 8  },
-    { header: 'Age',         key: 'age',       width: 8  },
-    { header: 'Owner',       key: 'owner',     width: 22 },
-    { header: 'Trainer',     key: 'trainer',   width: 22 },
-    { header: 'Jockey',      key: 'jockey',    width: 22 },
-    { header: 'Last Run',    key: 'lastRun',   width: 14 },
-    { header: 'Wins %',      key: 'winsPct',   width: 10 },
-    { header: 'Places %',    key: 'placesPct', width: 10 },
-  ];
-  styleHeader(ws3);
   ws3.views = [{ state: 'frozen', ySplit: 1 }];
-
-  const runnerMap = new Map(runners.map((r) => [r.name.toUpperCase(), r]));
-
+  const profCols = [
+    'No.', 'Horse', 'Career', 'Prize Money', 'Sire', 'Dam',
+    'Colour', 'Sex', 'Age', 'Owner', 'Trainer', 'Jockey',
+    'Last Run', 'Wins %', 'Places %',
+  ];
+  styleHeader(ws3.addRow(profCols), profCols.length);
+  const runnerMap = new Map(runners.map(r => [r.name.toUpperCase(), r]));
   formData.forEach((fd, i) => {
-    const cleanName = fd.name.replace(/\s*\(\d+\)\s*$/, '').trim();
-    const runner = runnerMap.get(cleanName.toUpperCase()) || {};
-    const p = fd.profile;
-    ws3.addRow({
-      number: runner.number || '', name: cleanName,
-      career: p.career, prize: p.prizeMoney,
-      sire: p.sire, dam: p.dam, colour: p.colour, sex: p.sex, age: p.age,
-      owner: p.owner, trainer: p.trainer || runner.trainer,
-      jockey: p.jockey || runner.jockey,
-      lastRun: p.lastRun, winsPct: p.winsPct, placesPct: p.placesPct,
-    });
-    styleDataRow(ws3, i + 2, i % 2 === 1);
+    const clean   = stripNum(fd.name);
+    const runner  = runnerMap.get(clean.toUpperCase()) || {};
+    const p       = fd.profile;
+    const row = ws3.addRow([
+      runner.number || '', clean,
+      p.career, p.prizeMoney, p.sire, p.dam, p.colour, p.sex, p.age,
+      p.owner, p.trainer || runner.trainer, p.jockey || runner.jockey,
+      p.lastRun, p.winsPct, p.placesPct,
+    ]);
+    styleData(row, profCols.length, i % 2 === 1);
   });
   autoWidth(ws3);
 
-  // ── Sheet 4: Condition Stats ──────────────────────────────────────────────
+  // ── Sheet 4: Condition Stats ───────────────────────────────────────────
   const ws4 = wb.addWorksheet('Condition Stats');
-  ws4.columns = [
-    { header: 'No.',       key: 'number',   width: 8  },
-    { header: 'Horse',     key: 'name',     width: 25 },
-    { header: 'Track',     key: 'track',    width: 16 },
-    { header: 'Distance',  key: 'distance', width: 16 },
-    { header: 'Trk&Dist',  key: 'trkDist',  width: 16 },
-    { header: 'Firm',      key: 'firm',     width: 14 },
-    { header: 'Good',      key: 'good',     width: 14 },
-    { header: 'Soft',      key: 'soft',     width: 14 },
-    { header: 'Heavy',     key: 'heavy',    width: 14 },
-    { header: 'Barrier',   key: 'barrier',  width: 14 },
-    { header: '1st Up',    key: 'firstUp',  width: 14 },
-    { header: '2nd Up',    key: 'secondUp', width: 14 },
-    { header: '3rd Up',    key: 'thirdUp',  width: 14 },
-  ];
-  styleHeader(ws4);
   ws4.views = [{ state: 'frozen', ySplit: 1 }];
-
+  const condCols = [
+    'No.', 'Horse', 'Track', 'Distance', 'Trk & Dist',
+    'Firm', 'Good', 'Soft', 'Heavy', 'Barrier', '1st Up', '2nd Up', '3rd Up',
+  ];
+  styleHeader(ws4.addRow(condCols), condCols.length);
   formData.forEach((fd, i) => {
-    const cleanName = fd.name.replace(/\s*\(\d+\)\s*$/, '').trim();
-    const runner = runnerMap.get(cleanName.toUpperCase()) || {};
-    const cs = fd.conditionStats;
-    ws4.addRow({
-      number: runner.number || '', name: cleanName,
-      track: cs.track, distance: cs.distance, trkDist: cs.trkDist,
-      firm: cs.firm, good: cs.good, soft: cs.soft, heavy: cs.heavy,
-      barrier: cs.barrier, firstUp: cs.firstUp, secondUp: cs.secondUp, thirdUp: cs.thirdUp,
-    });
-    styleDataRow(ws4, i + 2, i % 2 === 1);
+    const clean  = stripNum(fd.name);
+    const runner = runnerMap.get(clean.toUpperCase()) || {};
+    const cs     = fd.conditionStats;
+    styleData(ws4.addRow([
+      runner.number || '', clean,
+      cs.track, cs.distance, cs.trkDist,
+      cs.firm, cs.good, cs.soft, cs.heavy,
+      cs.barrier, cs.firstUp, cs.secondUp, cs.thirdUp,
+    ]), condCols.length, i % 2 === 1);
   });
   autoWidth(ws4);
 
-  // ── Sheet 5: Race History ─────────────────────────────────────────────────
+  // ── Sheet 5: Race History ──────────────────────────────────────────────
   const ws5 = wb.addWorksheet('Race History');
+  ws5.views = [{ state: 'frozen', ySplit: 1, xSplit: 2 }];
   const histCols = [
-    { header: 'No.',       key: 'number',   width: 8  },
-    { header: 'Horse',     key: 'name',     width: 25 },
-    { header: 'Placing',   key: 'placing',  width: 10 },
-    { header: 'Venue',     key: 'venue',    width: 18 },
-    { header: 'Date',      key: 'date',     width: 12 },
-    { header: 'Class',     key: 'class',    width: 16 },
-    { header: 'Dist',      key: 'distance', width: 10 },
-    { header: 'Weight',    key: 'weight',   width: 10 },
-    { header: 'Barrier',   key: 'barrier',  width: 10 },
-    { header: 'Odds',      key: 'odds',     width: 10 },
-    { header: 'Winner/2nd',key: 'winner2nd',width: 22 },
-    { header: 'Margin',    key: 'margin',   width: 10 },
-    { header: 'Time',      key: 'time',     width: 10 },
-    { header: 'In Run',    key: 'inRun',    width: 14 },
+    'No.', 'Horse', 'Placing', 'Venue', 'Date', 'Class',
+    'Dist', 'Weight', 'Barrier', 'Odds', 'Winner/2nd',
+    'Margin', 'Time', 'In Run',
   ];
-  ws5.columns = histCols;
-  styleHeader(ws5);
-  ws5.views = [{ state: 'frozen', xSplit: 2, ySplit: 1 }];
+  styleHeader(ws5.addRow(histCols), histCols.length);
 
-  let currentRow = 2;
+  let curRow = 2;
   for (const fd of formData) {
-    const cleanName = fd.name.replace(/\s*\(\d+\)\s*$/, '').trim();
-    const runner = runnerMap.get(cleanName.toUpperCase()) || {};
-    const boxNum = runner.number || '';
+    const clean  = stripNum(fd.name);
+    const runner = runnerMap.get(clean.toUpperCase()) || {};
+    const num    = runner.number || '';
 
-    // Section header row per horse
-    ws5.getCell(currentRow, 1).value = boxNum;
-    ws5.getCell(currentRow, 2).value = cleanName;
-    for (let c = 3; c <= histCols.length; c++) ws5.getCell(currentRow, c).value = '';
-    styleSectionRow(ws5, currentRow, histCols.length);
-    currentRow++;
+    const secRow = ws5.addRow([num, clean, ...Array(histCols.length - 2).fill('')]);
+    styleSection(secRow, histCols.length);
+    curRow++;
 
     let alt = false;
     for (const entry of fd.raceHistory) {
       if (entry.type === 'spell') {
-        ws5.getCell(currentRow, 1).value = entry.message;
-        ws5.mergeCells(currentRow, 1, currentRow, histCols.length);
-        styleSpellRow(ws5, currentRow, histCols.length);
-        currentRow++;
+        const r = ws5.addRow([entry.message]);
+        ws5.mergeCells(curRow, 1, curRow, histCols.length);
+        styleSpell(r, histCols.length);
         alt = false;
       } else {
-        ws5.addRow({
-          number: boxNum, name: cleanName,
-          placing: entry.placing, venue: entry.venue, date: entry.date,
-          class: entry.class, distance: entry.distance, weight: entry.weight,
-          barrier: entry.barrier, odds: entry.odds, winner2nd: entry.winner2nd,
-          margin: entry.margin, time: entry.time, inRun: entry.inRun,
-        });
-        styleDataRow(ws5, currentRow, alt);
-        currentRow++;
+        const r = ws5.addRow([
+          num, clean, entry.placing, entry.venue, entry.date, entry.class,
+          entry.distance, entry.weight, entry.barrier, entry.odds,
+          entry.winner2nd, entry.margin, entry.time, entry.inRun,
+        ]);
+        styleData(r, histCols.length, alt);
         alt = !alt;
       }
+      curRow++;
     }
   }
   autoWidth(ws5);
 
-  // ── Sheet 6: RacingZone Stats ─────────────────────────────────────────────
+  // ── Sheet 6: RacingZone Stats ──────────────────────────────────────────
   const ws6 = wb.addWorksheet('RacingZone Stats');
-  ws6.columns = [
-    { header: 'Horse',           key: 'name',            width: 25 },
-    { header: 'Career Starts',   key: 'careerStarts',    width: 14 },
-    { header: 'Career Wins',     key: 'careerWins',      width: 13 },
-    { header: 'Career 2nds',     key: 'careerSeconds',   width: 13 },
-    { header: 'Career 3rds',     key: 'careerThirds',    width: 13 },
-    { header: 'Career Win %',    key: 'careerWinPct',    width: 13 },
-    { header: 'Career Place %',  key: 'careerPlacePct',  width: 14 },
-    { header: 'Career Prize $',  key: 'careerPrizeMoney',width: 16 },
-    { header: 'L12M Starts',     key: 'l12mStarts',      width: 13 },
-    { header: 'L12M Wins',       key: 'l12mWins',        width: 12 },
-    { header: 'L12M 2nds',       key: 'l12mSeconds',     width: 12 },
-    { header: 'L12M 3rds',       key: 'l12mThirds',      width: 12 },
-    { header: 'By Distance',     key: 'statsByDistance', width: 40 },
-    { header: 'By Condition',    key: 'statsByCondition',width: 40 },
-    { header: 'By Track Type',   key: 'statsByTrackType',width: 40 },
-    { header: 'By Jockey',       key: 'statsByJockey',   width: 40 },
-    { header: 'By Trainer',      key: 'statsByTrainer',  width: 40 },
-    { header: 'Error',           key: 'error',           width: 30 },
-  ];
-  styleHeader(ws6);
   ws6.views = [{ state: 'frozen', ySplit: 1 }];
+  const rzCols = [
+    'Horse', 'Career Starts', 'Career Wins', 'Career 2nds', 'Career 3rds',
+    'Career Win %', 'Career Place %', 'Career Prize $',
+    'L12M Starts', 'L12M Wins', 'L12M 2nds', 'L12M 3rds',
+    'By Distance', 'By Condition', 'By Track Type', 'By Jockey', 'By Trainer', 'Error',
+  ];
+  styleHeader(ws6.addRow(rzCols), rzCols.length);
   horseStats.forEach((s, i) => {
-    ws6.addRow(s);
-    styleDataRow(ws6, i + 2, i % 2 === 1);
+    styleData(ws6.addRow([
+      s.name, s.careerStarts, s.careerWins, s.careerSeconds, s.careerThirds,
+      s.careerWinPct, s.careerPlacePct, s.careerPrizeMoney,
+      s.l12mStarts, s.l12mWins, s.l12mSeconds, s.l12mThirds,
+      s.statsByDistance, s.statsByCondition, s.statsByTrackType,
+      s.statsByJockey, s.statsByTrainer, s.error,
+    ]), rzCols.length, i % 2 === 1);
   });
   autoWidth(ws6);
 
@@ -939,37 +714,46 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const url = await promptForUrl();
+  const url        = await promptForUrl();
   const outputPath = resolveOutputPath(args.output);
   info('Output directory:', outputPath);
 
-  info('Launching Chromium...');
-  const browser = await buildBrowser();
-  const page = await newPage(browser);
+  info('Launching Chrome...');
+  const browser = await puppeteer.launch({
+    headless: false,
+    defaultViewport: null,          // use real window size
+    args: ['--start-maximized'],
+  });
 
   try {
-    // Step 1: Load the TAB race page
+    // Reuse the tab Chrome already opened (same as greyhoundracing/index.js)
+    const [page] = await browser.pages();
+
     info('Navigating to:', url);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    await dismissCookieBanner(page);
-    await waitForPage(page);
+    info('Waiting for runners...');
+    await waitForRunners(page);
     await sleep(2000);
 
-    // Step 2: Click "Show All Form" to expand all form panels
+    // Dismiss cookie banner
+    try {
+      const cookieBtn = await page.$("[class*='cookie'] button, [id*='cookie'] button");
+      if (cookieBtn) { await cookieBtn.click(); await sleep(1000); info('Cookie banner dismissed.'); }
+    } catch { /* ignore */ }
+
     info('Clicking "Show All Form"...');
     await clickShowAllForm(page);
     await sleep(3000);
 
-    // Step 3: Scrape race metadata and runners
     info('Scraping race info...');
-    const raceInfo = await getRaceInfo(page, url);
-    info(`Race: ${raceInfo.raceName} | ${raceInfo.date} | ${raceInfo.venue} | R${raceInfo.raceNum}`);
+    const raceInfo = await getRaceInfo(page);
+    info(`Race: ${raceInfo.raceName || 'Unknown'} | ${raceInfo.date || ''} | ${raceInfo.venue || ''} | R${raceInfo.raceNum || ''}`);
 
     info('Scraping runners...');
-    const runners = await scrapeRunners(page);
-    const active    = runners.filter((r) => !r.scratched);
-    const scratched = runners.filter((r) => r.scratched);
+    const runners   = await scrapeRunners(page);
+    const active    = runners.filter(r => !r.scratched);
+    const scratched = runners.filter(r => r.scratched);
     info(`Runners: ${runners.length} total (${active.length} active, ${scratched.length} scratched)`);
 
     if (!runners.length) {
@@ -977,12 +761,10 @@ async function main() {
       process.exit(1);
     }
 
-    // Step 4: Scrape expanded form data
     info('Scraping form data...');
     const formData = await scrapeFormData(page);
     info(`Form data scraped for ${formData.length} horses`);
 
-    // Step 5: RacingZone lookup for each active horse
     info('Starting RacingZone lookups...');
     const horseStats = [];
     for (let i = 0; i < runners.length; i++) {
@@ -992,12 +774,10 @@ async function main() {
         continue;
       }
       info(`[${i + 1}/${runners.length}] RacingZone: ${runner.name}`);
-      const stats = await scrapeRacingZoneHorse(page, runner.name);
-      horseStats.push(stats);
+      horseStats.push(await scrapeRacingZoneHorse(page, runner.name));
       if (i < runners.length - 1) await sleep(args.delayMs);
     }
 
-    // Step 6: Save to Excel
     const outputFile = await saveToExcel(raceInfo, runners, formData, horseStats, outputPath);
     console.log(`\nDone! Excel file saved to: ${outputFile}`);
 
@@ -1006,7 +786,7 @@ async function main() {
   }
 }
 
-main().catch((err) => {
+main().catch(err => {
   error('Fatal error:', err.message);
   process.exit(1);
 });
