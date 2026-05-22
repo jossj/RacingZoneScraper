@@ -290,133 +290,6 @@ function extractRaceInfoFromApi(apiObj) {
 }
 
 // ---------------------------------------------------------------------------
-// React in-memory state extraction
-// ---------------------------------------------------------------------------
-
-async function extractFromPageState(page) {
-  return page.evaluate(() => {
-    function looksLikeRunner(obj) {
-      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
-      const keys = Object.keys(obj).map(k => k.toLowerCase());
-      return (
-        keys.some(k => k.includes('horse') || k.includes('runner') || k.includes('competitor') || k === 'tabno' || k === 'name') &&
-        keys.some(k => k.includes('jockey') || k.includes('rider') || k.includes('trainer') ||
-                       k.includes('barrier') || k.includes('weight') || k.includes('form') ||
-                       k.includes('price') || k.includes('odds'))
-      );
-    }
-
-    function findRunners(obj, depth) {
-      if (depth > 20 || !obj || typeof obj !== 'object') return null;
-      if (Array.isArray(obj)) {
-        if (obj.length >= 2 && looksLikeRunner(obj[0])) return obj;
-        for (const item of obj) { const r = findRunners(item, depth + 1); if (r) return r; }
-        return null;
-      }
-      for (const val of Object.values(obj)) { const r = findRunners(val, depth + 1); if (r) return r; }
-      return null;
-    }
-
-    // 1. Common Redux / Zustand / MobX window globals
-    for (const key of ['__STORE__','__INITIAL_STATE__','__redux_store','__REDUX_STATE__','__APP_STATE__','__DATA__']) {
-      try {
-        const raw = window[key];
-        if (!raw) continue;
-        const data = typeof raw.getState === 'function' ? raw.getState() : raw;
-        const r = findRunners(data, 0);
-        if (r) return { source: 'window.' + key, runners: r };
-      } catch {}
-    }
-
-    // 2. Scan all window properties matching racing keywords
-    for (const key of Object.keys(window)) {
-      if (!/^(?:store|state|data|race|form|runner|horse|entry|field)/i.test(key)) continue;
-      try {
-        const raw = window[key];
-        const data = typeof raw?.getState === 'function' ? raw.getState() : raw;
-        const r = findRunners(data, 0);
-        if (r) return { source: 'window.' + key, runners: r };
-      } catch {}
-    }
-
-    // 3. Walk the React fiber tree
-    const rootEl = (
-      document.getElementById('root') ||
-      document.getElementById('app') ||
-      document.querySelector('[data-reactroot]') ||
-      document.body
-    );
-    if (!rootEl) return null;
-
-    const fiberKey = Object.keys(rootEl).find(k =>
-      k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
-    );
-    if (!fiberKey) return null;
-
-    function walkFiber(node, depth) {
-      if (!node || depth > 80) return null;
-      // Walk hook state linked list
-      let hook = node.memoizedState;
-      while (hook && typeof hook === 'object') {
-        const v = hook.memoizedState;
-        if (v !== null && v !== undefined) {
-          const r = findRunners(v, 0);
-          if (r) return r;
-        }
-        hook = hook.next;
-      }
-      // Check props
-      const r = findRunners(node.memoizedProps, 0);
-      if (r) return r;
-      return walkFiber(node.child, depth + 1) || walkFiber(node.sibling, depth + 1);
-    }
-
-    const runners = walkFiber(rootEl[fiberKey], 0);
-    if (runners) return { source: 'react-fiber', runners };
-    return null;
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Direct API endpoint discovery
-// ---------------------------------------------------------------------------
-
-async function tryDirectApiEndpoints(page, formUrl) {
-  const uuidMatch = formUrl.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-  if (!uuidMatch) return [];
-  const uuid = uuidMatch[0];
-
-  return page.evaluate(async (uuid, origin) => {
-    const candidates = [
-      `${origin}/api/form/${uuid}`,
-      `${origin}/api/v1/form/${uuid}`,
-      `${origin}/api/v2/form/${uuid}`,
-      `${origin}/api/race/${uuid}`,
-      `${origin}/api/v1/race/${uuid}`,
-      `${origin}/api/race-guide/${uuid}`,
-      `${origin}/api/formguide/${uuid}`,
-      `${origin}/api/entries/${uuid}`,
-      `https://api.ladbrokesform.com.au/form/${uuid}`,
-      `https://api.ladbrokesform.com.au/race/${uuid}`,
-      `https://form.api.ladbrokesform.com.au/form/${uuid}`,
-    ];
-    const results = [];
-    for (const url of candidates) {
-      try {
-        const resp = await fetch(url, { headers: { Accept: 'application/json' }, credentials: 'include' });
-        if (resp.ok) {
-          const ct = resp.headers.get('content-type') || '';
-          if (ct.includes('json')) {
-            results.push({ url, data: await resp.json() });
-          }
-        }
-      } catch {}
-    }
-    return results;
-  }, uuid, new URL(formUrl).origin);
-}
-
-// ---------------------------------------------------------------------------
 // DOM-based scraping (fallback when API intercept has no runner data)
 // ---------------------------------------------------------------------------
 
@@ -1453,45 +1326,7 @@ async function main() {
   try {
     const [page] = await browser.pages();
 
-    // ── Intercept fetch/XHR at page level BEFORE any page JS runs ─────────
-    // This catches data served from cache or through service workers that
-    // the network-level listener may miss.
-    await page.evaluateOnNewDocument(() => {
-      window.__capturedApiData = [];
-
-      const _fetch = window.fetch;
-      window.fetch = async function(input, init) {
-        const res = await _fetch.apply(this, arguments);
-        try {
-          const ct = res.headers.get('content-type') || '';
-          if (ct.includes('json')) {
-            res.clone().json().then(data => {
-              const reqUrl = typeof input === 'string' ? input : input?.url || '';
-              window.__capturedApiData.push({ url: reqUrl, data });
-            }).catch(() => {});
-          }
-        } catch {}
-        return res;
-      };
-
-      const _open = XMLHttpRequest.prototype.open;
-      const _send = XMLHttpRequest.prototype.send;
-      const _xhrUrls = new WeakMap();
-      XMLHttpRequest.prototype.open = function(m, u) { _xhrUrls.set(this, u); return _open.apply(this, arguments); };
-      XMLHttpRequest.prototype.send = function() {
-        this.addEventListener('loadend', () => {
-          if (this.status === 200) {
-            try {
-              const data = JSON.parse(this.responseText || this.response);
-              window.__capturedApiData.push({ url: _xhrUrls.get(this) || '', data });
-            } catch {}
-          }
-        });
-        return _send.apply(this, arguments);
-      };
-    });
-
-    // ── Intercept at network level too (Puppeteer's own listener) ─────────
+    // ── Intercept JSON API responses ──────────────────────────────────────
     const capturedJson = [];
     page.on('response', async (response) => {
       try {
@@ -1515,12 +1350,12 @@ async function main() {
     let runners  = [];
     let raceInfo = { url };
 
-    // ── Attempt 1a: network-level intercepted JSON ────────────────────────
-    info(`Network interceptor captured ${capturedJson.length} JSON response(s) — scanning...`);
+    // ── Attempt 1: network-intercepted JSON API ───────────────────────────
+    info(`Captured ${capturedJson.length} JSON response(s) — scanning for runner data...`);
     for (const resp of capturedJson) {
       const arr = findRunnersArray(resp.data);
       if (arr && arr.length >= 2) {
-        info(`Runners found in network response: ${resp.url} (${arr.length} items)`);
+        info(`Runners found in API response: ${resp.url} (${arr.length} items)`);
         runners  = arr.map(mapApiRunner).filter(r => r.name.length > 0);
         const ri = extractRaceInfoFromApi(resp.data);
         raceInfo = Object.assign({ url }, ri);
@@ -1528,56 +1363,13 @@ async function main() {
       }
     }
 
-    // ── Attempt 1b: page-level fetch/XHR interceptor ──────────────────────
-    if (!runners.length) {
-      const pageCapture = await page.evaluate(() => window.__capturedApiData || []);
-      info(`Page-level interceptor captured ${pageCapture.length} JSON response(s) — scanning...`);
-      for (const resp of pageCapture) {
-        const arr = findRunnersArray(resp.data);
-        if (arr && arr.length >= 2) {
-          info(`Runners found in page-intercepted response: ${resp.url} (${arr.length} items)`);
-          runners  = arr.map(mapApiRunner).filter(r => r.name.length > 0);
-          const ri = extractRaceInfoFromApi(resp.data);
-          raceInfo = Object.assign({ url }, ri);
-          break;
-        }
-      }
-    }
-
-    // ── Attempt 2: React in-memory state / window globals ─────────────────
-    if (!runners.length) {
-      warn('No runners in API responses — trying React state extraction...');
-      const stateResult = await extractFromPageState(page);
-      if (stateResult && stateResult.runners && stateResult.runners.length >= 2) {
-        info(`Runners found in ${stateResult.source} (${stateResult.runners.length} items)`);
-        runners  = stateResult.runners.map(mapApiRunner).filter(r => r.name.length > 0);
-      }
-    }
-
-    // ── Attempt 3: direct API endpoint discovery ──────────────────────────
-    if (!runners.length) {
-      warn('No state data found — probing API endpoints directly...');
-      const directResults = await tryDirectApiEndpoints(page, url);
-      for (const resp of directResults) {
-        info(`Direct API response from: ${resp.url}`);
-        const arr = findRunnersArray(resp.data);
-        if (arr && arr.length >= 2) {
-          info(`Runners found via direct endpoint (${arr.length} items)`);
-          runners  = arr.map(mapApiRunner).filter(r => r.name.length > 0);
-          const ri = extractRaceInfoFromApi(resp.data);
-          raceInfo = Object.assign({ url }, ri);
-          break;
-        }
-      }
-    }
-
-    // ── Save full rendered HTML (always — useful for inspection) ─────────
+    // ── Save full rendered HTML (always — useful for inspection) ──────────
     info('Saving rendered HTML snapshot...');
     const snapshotHtml = await saveHtmlSnapshot(page, outputPath);
 
-    // ── Attempt 4: cheerio extraction from saved HTML ─────────────────────
+    // ── Attempt 2: cheerio extraction from saved HTML ─────────────────────
     if (!runners.length) {
-      warn('No API/state data found — trying cheerio extraction from HTML snapshot...');
+      warn('No runner data in API responses — trying cheerio extraction from HTML snapshot...');
       const cheerioResult = extractRunnersFromHtml(snapshotHtml);
       if (cheerioResult.runners.length >= 2) {
         info(`cheerio extracted ${cheerioResult.runners.length} runner(s)`);
@@ -1588,7 +1380,7 @@ async function main() {
       }
     }
 
-    // ── Attempt 5: in-browser DOM scraping ───────────────────────────────
+    // ── Attempt 3: in-browser DOM scraping ───────────────────────────────
     if (!runners.length) {
       warn('cheerio found nothing — falling back to in-browser DOM scraping...');
       runners = await scrapeRunnersFromDom(page);
@@ -1600,7 +1392,7 @@ async function main() {
       if (!raceInfo[key]) raceInfo[key] = domRaceInfo[key];
     }
 
-    // ── Attempt 6: Claude Vision (last resort) ────────────────────────────
+    // ── Attempt 4: Claude Vision (last resort) ────────────────────────────
     if (!runners.length) {
       warn('All structural extraction failed — trying Claude Vision as last resort...');
       const visionResult = await extractRunnersWithVision(page, raceInfo);
