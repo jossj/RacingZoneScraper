@@ -353,6 +353,7 @@ async function fillInput(page, selector, value) {
 async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
   const stats = {
     name: horseName, error: '',
+    rsRating: '',
     careerStarts: '', careerWins: '', careerSeconds: '', careerThirds: '',
     careerWinPct: '', careerPlacePct: '', careerPrizeMoney: '',
     l12mStarts: '', l12mWins: '', l12mSeconds: '', l12mThirds: '',
@@ -461,6 +462,25 @@ async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
       }
     }
 
+    // Extract RS Rating from DOM before screenshot
+    try {
+      const domRsRating = await page.evaluate(() => {
+        const candidates = [...document.querySelectorAll('[class*="rating" i], [class*="ris" i], [class*="rs-" i]')];
+        for (const el of candidates) {
+          const nums = (el.textContent || '').match(/\b(\d{2,3})\b/g) || [];
+          for (const n of nums) {
+            const val = parseInt(n, 10);
+            if (val >= 40 && val <= 140) return String(val);
+          }
+        }
+        return '';
+      });
+      if (domRsRating) {
+        stats.rsRating = domRsRating;
+        info(`  RS Rating (DOM): ${domRsRating}`);
+      }
+    } catch { /* ignore */ }
+
     info(`  Taking screenshot and running OCR: ${page.url()}`);
     const ocrText = await screenshotAndOcr(page, horseName, screenshotDir);
     parseOcrText(ocrText, stats);
@@ -559,6 +579,19 @@ function parseOcrText(rawText, stats) {
 
   // Log first 300 chars of OCR to help diagnose heading / format issues
   info(`  OCR preview: ${rawText.slice(0, 300).replace(/\n/g, ' ↵ ')}`);
+
+  // RS Rating — badge reads "RIS / <number> / Rating" (OCR may render RIS, R|S, RI$, etc.)
+  if (!stats.rsRating) {
+    const rsMatch =
+      rawText.match(/R[I|!][S$]\s*\n\s*(\d{2,3})\s*\n\s*Rating/i) ||
+      rawText.match(/(\d{2,3})\s*\n\s*Rating\s*\n\s*R[I|!][S$]/i) ||
+      rawText.match(/\bRS\s+Rating[:\s]+(\d{2,3})\b/i) ||
+      rawText.match(/\bRating\s*[:\s]\s*(\d{2,3})\s*\n/i);
+    if (rsMatch) {
+      stats.rsRating = rsMatch[1];
+      info(`  RS Rating (OCR): ${rsMatch[1]}`);
+    }
+  }
 
   // Phase 1 — scan every line for profile fields, career stats, section headings
   let currentSection = null;
@@ -756,6 +789,7 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
   const wb = new ExcelJS.Workbook();
 
   const stripNum = name => name.replace(/\s*\(\d+\)\s*$/, '').trim();
+  const horseStatsMap = new Map(horseStats.map(s => [s.name.toUpperCase(), s]));
 
   // ── Sheet 1: Race Info ──────────────────────────────────────────────────
   const ws1 = wb.addWorksheet('Race Info');
@@ -777,13 +811,15 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
   const ws2 = wb.addWorksheet('Runners (TAB)');
   ws2.views = [{ state: 'frozen', ySplit: 1 }];
   const runnerCols = [
-    'No.', 'Horse', 'Jockey', 'Trainer', 'Form', 'Weight', 'Rating',
+    'No.', 'Horse', 'Jockey', 'Trainer', 'Form', 'Weight', 'RS Rating',
     'FO Win', 'FO Place', 'Tote Win', 'Tote Place', 'Scratched',
   ];
   styleHeader(ws2.addRow(runnerCols), runnerCols.length);
   runners.forEach((r, i) => {
+    const rzStat    = horseStatsMap.get(r.name.toUpperCase()) || {};
+    const rsRating  = rzStat.rsRating || '';
     const row = ws2.addRow([
-      r.number, r.name, r.jockey, r.trainer, r.form, r.weight, r.rating,
+      r.number, r.name, r.jockey, r.trainer, r.form, r.weight, rsRating,
       r.winOdds, r.placeOdds, r.toteWin, r.totePlace,
       r.scratched ? 'Yes' : 'No',
     ]);
@@ -885,7 +921,8 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
   const ws6 = wb.addWorksheet('RacingZone Stats');
   ws6.views = [{ state: 'frozen', ySplit: 1 }];
   const rzCols = [
-    'Horse', 'Career Starts', 'Career Wins', 'Career 2nds', 'Career 3rds',
+    'Horse', 'RS Rating',
+    'Career Starts', 'Career Wins', 'Career 2nds', 'Career 3rds',
     'Career Win %', 'Career Place %', 'Career Prize $',
     'L12M Starts', 'L12M Wins', 'L12M 2nds', 'L12M 3rds',
     'By Distance', 'By Condition', 'By Track Type', 'By Jockey', 'By Trainer', 'Error',
@@ -893,7 +930,8 @@ async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) 
   styleHeader(ws6.addRow(rzCols), rzCols.length);
   horseStats.forEach((s, i) => {
     styleData(ws6.addRow([
-      s.name, s.careerStarts, s.careerWins, s.careerSeconds, s.careerThirds,
+      s.name, s.rsRating || '',
+      s.careerStarts, s.careerWins, s.careerSeconds, s.careerThirds,
       s.careerWinPct, s.careerPlacePct, s.careerPrizeMoney,
       s.l12mStarts, s.l12mWins, s.l12mSeconds, s.l12mThirds,
       s.statsByDistance, s.statsByCondition, s.statsByTrackType,
