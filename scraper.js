@@ -313,47 +313,122 @@ function extractRunnerFromElement($, el) {
   };
 }
 
+function parseResult(text) {
+  const out = { first: '', second: '', third: '' };
+  if (!text) return out;
+  const parts = text.split(/\s*\/\s*/);
+  for (const part of parts) {
+    const m = part.match(/^(\d+)\.\s*(.+)$/);
+    if (!m) continue;
+    if (m[1] === '1') out.first  = m[2].trim();
+    if (m[1] === '2') out.second = m[2].trim();
+    if (m[1] === '3') out.third  = m[2].trim();
+  }
+  return out;
+}
+
+function buildColMap(headers) {
+  const map = {};
+  headers.forEach((c, i) => {
+    const n = c.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if      (n === 'place')                        map.position   = i;
+    else if (n === 'date')                         map.date       = i;
+    else if (n === 'track')                        map.venue      = i;
+    else if (n === 'distance')                     map.distance   = i;
+    else if (n === 'class')                        map.raceClass  = i;
+    else if (n === 'barrier')                      map.barrier    = i;
+    else if (n === 'jockey')                       map.jockey     = i;
+    else if (n === 'weight')                       map.weight     = i;
+    else if (n === 'cond')                         map.condition  = i;
+    else if (n === 'racetime')                     map.time       = i;
+    else if (n === 'avgspeed')                     map.avgSpeed   = i;
+    else if (n === 'last600m')                     map.last600m   = i;
+    else if (n === 'margin')                       map.margin     = i;
+    else if (n === '800400')                       map.sectionals = i;
+    else if (n === 'sp')                           map.sp         = i;
+    else if (n === 'days')                         map.days       = i;
+    else if (n === 'prize' && map.prize === undefined) map.prize  = i;
+    else if (n === 'prizewon')                     map.prizeWon   = i;
+    else if (n === 'result' || n === 'placegetters') map.result   = i;
+  });
+  return map;
+}
+
+function cellsToHistRow(cells, colMap) {
+  const get = f => (colMap[f] !== undefined ? cells[colMap[f]] || '' : '');
+  const placement = parseResult(get('result'));
+  return {
+    position:   get('position'),
+    date:       get('date'),
+    venue:      get('venue'),
+    distance:   get('distance'),
+    raceClass:  get('raceClass'),
+    barrier:    get('barrier'),
+    jockey:     get('jockey'),
+    weight:     get('weight'),
+    condition:  get('condition'),
+    time:       get('time'),
+    avgSpeed:   get('avgSpeed'),
+    last600m:   get('last600m'),
+    margin:     get('margin'),
+    sectionals: get('sectionals'),
+    sp:         get('sp'),
+    days:       get('days'),
+    prize:      get('prize'),
+    prizeWon:   get('prizeWon'),
+    first:      placement.first,
+    second:     placement.second,
+    third:      placement.third,
+    raw:        cells.join(' | '),
+  };
+}
+
+function isHistHeader(cells) {
+  return cells.some(c => /^place$/i.test(c) || /^track$/i.test(c) || /^date$/i.test(c));
+}
+
+function isDaySpell(cells) {
+  return /\d+\s+Day\s+Spell/i.test(cells.join(' '));
+}
+
 function extractRaceHistoryFromElement($, $el) {
   const history = [];
 
-  // Try table rows
-  $el.find('tr').each(function() {
-    const cells = $(this).find('td, th')
-      .map((_, td) => $(td).text().trim()).toArray().filter(Boolean);
-    if (cells.length >= 3) history.push(parseHistRow(cells));
+  // ── Table-based extraction with header-driven column mapping ──────────────
+  $el.find('table').each(function() {
+    let colMap = null;
+    const tableRows = [];
+    $(this).find('tr').each(function() {
+      const cells = $(this).find('td, th').map((_, c) => $(c).text().trim()).toArray();
+      if (!cells.length || cells.every(c => !c)) return;
+      if (isDaySpell(cells)) return;
+      if (isHistHeader(cells)) { colMap = buildColMap(cells); return; }
+      if (!colMap) return;
+      if (isHistHeader(cells)) return;  // repeated header row
+      const row = cellsToHistRow(cells, colMap);
+      if (row.date || row.position) tableRows.push(row);
+    });
+    history.push(...tableRows);
   });
   if (history.length) return history;
 
-  // Try structured row-like elements
-  $el.find('[class*="row" i],[class*="item" i],[class*="entry" i],[class*="start" i],[class*="run" i]').each(function() {
-    const leafTexts = $(this).find('span, p, b, strong').map((_, leaf) => {
-      return $(leaf).contents().filter((_, n) => n.type === 'text').text().trim();
-    }).toArray().filter(Boolean);
-    if (leafTexts.length >= 3) history.push(parseHistRow(leafTexts));
+  // ── Div-based extraction: find a header div then map positional children ──
+  let colMap = null;
+  $el.find('div, ul, ol').each(function() {
+    const $row = $(this);
+    if ($row.find('div').length > 12) return;  // skip wrapper elements
+    const children = $row.children().toArray();
+    if (children.length < 4) return;
+    const cells = children.map(c => $(c).text().trim());
+    if (cells.every(c => !c)) return;
+    if (isDaySpell(cells)) return;
+    if (isHistHeader(cells)) { colMap = buildColMap(cells); return; }
+    if (!colMap) return;
+    const row = cellsToHistRow(cells, colMap);
+    if (row.date || row.position) history.push(row);
   });
 
   return history;
-}
-
-function parseHistRow(cells) {
-  const row = { raw: cells.join(' | ') };
-  for (const c of cells) {
-    if (!row.date      && /\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}/.test(c)) { row.date = c; continue; }
-    if (!row.distance  && /^\d{3,4}m$/i.test(c))                           { row.distance = c; continue; }
-    if (!row.condition && /^(Firm|Good|Soft|Heavy|Syn|Wet)\d*$/i.test(c))  { row.condition = c; continue; }
-    if (!row.raceClass && /^(G[123]|Listed|BM\d+|MDN|CL\d+|Hcp|WFA)/i.test(c)) { row.raceClass = c; continue; }
-    if (!row.position  && /^\d{1,2}(st|nd|rd|th)?$/i.test(c))             { row.position = c; continue; }
-    if (!row.margin    && /^(\d+(\.\d+)?L|SH|NK|HD|NS|NECK|HEAD)$/i.test(c)) { row.margin = c; continue; }
-    if (!row.time      && /^\d:\d{2}\.\d{1,2}$/.test(c))                  { row.time = c; continue; }
-    if (!row.weight    && /^\d{2}(\.\d)?$/.test(c) && +c >= 48 && +c <= 65) { row.weight = c; continue; }
-    if (!row.odds      && /^\$?[\d]+\.?\d{0,2}$/.test(c))                 { row.odds = c.replace('$', ''); }
-  }
-  for (const c of cells) {
-    if (!row.venue && /^[A-Z][a-z]+(\s[A-Z][a-z]+)?$/.test(c.trim()) && c.length < 25) {
-      row.venue = c.trim(); break;
-    }
-  }
-  return row;
 }
 
 function extractRunnersFromHtml(html) {
@@ -536,7 +611,12 @@ async function saveToExcel(raceInfo, runners, outputPath) {
   {
     const ws = wb.addWorksheet('Race History');
     ws.views = [{ state: 'frozen', ySplit: 1, xSplit: 2 }];
-    const cols = ['No.','Horse','Date','Venue','Distance','Condition','Class','Position','Margin','Time','Weight','Odds','Jockey','Barrier','Raw'];
+    const cols = [
+      'No.','Horse','Position','Date','Track','Distance','Class',
+      'Barrier','Jockey','Weight','Condition','Time','Avg Speed',
+      'Last 600m','Margin','800/400','SP','Days','Prize','Prize Won',
+      '1st','2nd','3rd','Raw',
+    ];
     styleHeader(ws.addRow(cols), cols.length);
     for (const r of runners) {
       if (!r.raceHistory || !r.raceHistory.length) continue;
@@ -545,9 +625,13 @@ async function saveToExcel(raceInfo, runners, outputPath) {
       for (const e of r.raceHistory) {
         styleData(ws.addRow([
           r.number, r.name,
-          e.date || '', e.venue || '', e.distance || '', e.condition || '',
-          e.raceClass || '', e.position || '', e.margin || '', e.time || '',
-          e.weight || '', e.odds || '', e.jockey || '', e.barrier || '', e.raw || '',
+          e.position || '', e.date || '', e.venue || '', e.distance || '',
+          e.raceClass || '', e.barrier || '', e.jockey || '', e.weight || '',
+          e.condition || '', e.time || '', e.avgSpeed || '', e.last600m || '',
+          e.margin || '', e.sectionals || '', e.sp || '', e.days || '',
+          e.prize || '', e.prizeWon || '',
+          e.first || '', e.second || '', e.third || '',
+          e.raw || '',
         ]), cols.length, alt);
         alt = !alt;
       }
