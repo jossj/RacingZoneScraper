@@ -7,6 +7,9 @@ const path      = require('path');
 const fs        = require('fs');
 const os        = require('os');
 
+let Anthropic = null;
+try { Anthropic = require('@anthropic-ai/sdk'); } catch { /* vision extraction unavailable */ }
+
 const DEFAULT_OUTPUT   = 'C:\\tab\\scrape';
 const DEFAULT_DELAY_MS = 1000;
 
@@ -656,6 +659,204 @@ async function scrapeRunnersFromDom(page) {
 }
 
 // ---------------------------------------------------------------------------
+// Claude Vision extraction
+// ---------------------------------------------------------------------------
+
+async function extractRunnersWithVision(page, raceInfo) {
+  if (!Anthropic) {
+    warn('Vision extraction unavailable: @anthropic-ai/sdk not installed.');
+    return null;
+  }
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    warn('Vision extraction unavailable: ANTHROPIC_API_KEY environment variable not set.');
+    warn('  Windows:  set ANTHROPIC_API_KEY=sk-ant-...');
+    warn('  Mac/Linux: export ANTHROPIC_API_KEY=sk-ant-...');
+    return null;
+  }
+
+  info('Attempting Claude Vision extraction...');
+
+  // Scroll to top before shooting
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await sleep(600);
+
+  // Full-page JPEG (compressed to stay well within API limits)
+  let imgBuf = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 85 });
+  const sizeMB = imgBuf.length / 1024 / 1024;
+  info(`Screenshot: ${(await page.evaluate(() => document.body.scrollHeight)).toLocaleString()}px tall, ${sizeMB.toFixed(1)} MB`);
+  if (sizeMB > 10) {
+    warn('Screenshot large — reducing quality to fit within API limits...');
+    imgBuf = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 60 });
+    info(`Reduced to ${(imgBuf.length / 1024 / 1024).toFixed(1)} MB`);
+  }
+
+  const base64 = imgBuf.toString('base64');
+  const client = new Anthropic({ apiKey });
+
+  const prompt = `This is a screenshot of a Ladbrokes horse racing form guide page. Extract ALL race and runner information visible.
+
+Return a single JSON object — no markdown, no explanation, just the JSON:
+{
+  "raceInfo": {
+    "raceName": "",
+    "venue": "",
+    "date": "",
+    "raceNum": "",
+    "distance": "",
+    "raceClass": "",
+    "trackCondition": "",
+    "details": ""
+  },
+  "runners": [
+    {
+      "number": "",
+      "name": "",
+      "barrier": "",
+      "jockey": "",
+      "trainer": "",
+      "weight": "",
+      "form": "",
+      "winOdds": "",
+      "placeOdds": "",
+      "ageSexColour": "",
+      "sire": "",
+      "dam": "",
+      "scratched": false,
+      "careerStarts": "",
+      "careerWins": "",
+      "careerSeconds": "",
+      "careerThirds": "",
+      "prizeMoney": "",
+      "winPct": "",
+      "placePct": "",
+      "condStats": {
+        "Distance": "",
+        "Track": "",
+        "Firm": "",
+        "Good": "",
+        "Soft": "",
+        "Heavy": ""
+      },
+      "raceHistory": [
+        {
+          "date": "",
+          "venue": "",
+          "distance": "",
+          "condition": "",
+          "raceClass": "",
+          "position": "",
+          "margin": "",
+          "time": "",
+          "weight": "",
+          "odds": "",
+          "jockey": "",
+          "barrier": ""
+        }
+      ]
+    }
+  ]
+}
+
+Rules:
+- Extract EVERY horse visible (do not skip any).
+- Use empty string "" for any field not visible.
+- For condStats, use format like "5:1-2-1" (starts:wins-2nds-3rds) if shown as numbers, or just copy the displayed text.
+- Include every race history row you can read.
+- Return ONLY the JSON object.`;
+
+  try {
+    info('Sending to Claude API for extraction (this may take 30–90 seconds)...');
+    const stream = client.messages.stream({
+      model:      'claude-opus-4-7',
+      max_tokens: 16000,
+      thinking:   { type: 'adaptive' },
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
+          { type: 'text',  text: prompt },
+        ],
+      }],
+    });
+
+    const response = await stream.finalMessage();
+
+    const textBlock = response.content.find(b => b.type === 'text');
+    if (!textBlock || !textBlock.text) throw new Error('Claude returned no text content');
+
+    // Strip any markdown code fences Claude might have added
+    const raw = textBlock.text.replace(/```(?:json)?/gi, '').trim();
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON object in Claude response');
+
+    const extracted = JSON.parse(jsonMatch[0]);
+
+    // Merge race info (don't overwrite existing values)
+    const mergedRaceInfo = { ...raceInfo };
+    if (extracted.raceInfo && typeof extracted.raceInfo === 'object') {
+      for (const [k, v] of Object.entries(extracted.raceInfo)) {
+        if (v && !mergedRaceInfo[k]) mergedRaceInfo[k] = String(v);
+      }
+    }
+
+    const toStr = v => (v === null || v === undefined) ? '' : String(v);
+
+    const runners = (extracted.runners || [])
+      .map(r => ({
+        number:        toStr(r.number),
+        name:          toStr(r.name),
+        barrier:       toStr(r.barrier),
+        jockey:        toStr(r.jockey),
+        trainer:       toStr(r.trainer),
+        weight:        toStr(r.weight),
+        form:          toStr(r.form),
+        winOdds:       toStr(r.winOdds),
+        placeOdds:     toStr(r.placeOdds),
+        ageSexColour:  toStr(r.ageSexColour),
+        sire:          toStr(r.sire),
+        dam:           toStr(r.dam),
+        scratched:     Boolean(r.scratched),
+        careerStarts:  toStr(r.careerStarts),
+        careerWins:    toStr(r.careerWins),
+        careerSeconds: toStr(r.careerSeconds),
+        careerThirds:  toStr(r.careerThirds),
+        prizeMoney:    toStr(r.prizeMoney),
+        winPct:        toStr(r.winPct),
+        placePct:      toStr(r.placePct),
+        condStats: (r.condStats && typeof r.condStats === 'object')
+          ? Object.fromEntries(Object.entries(r.condStats).map(([k, v]) => [k, toStr(v)]))
+          : {},
+        raceHistory: Array.isArray(r.raceHistory)
+          ? r.raceHistory.map(h => ({
+              date:      toStr(h.date),
+              venue:     toStr(h.venue),
+              distance:  toStr(h.distance),
+              condition: toStr(h.condition),
+              raceClass: toStr(h.raceClass),
+              position:  toStr(h.position),
+              margin:    toStr(h.margin),
+              time:      toStr(h.time),
+              weight:    toStr(h.weight),
+              odds:      toStr(h.odds),
+              jockey:    toStr(h.jockey),
+              barrier:   toStr(h.barrier),
+              raw:       '',
+            }))
+          : [],
+      }))
+      .filter(r => r.name.length > 0);
+
+    info(`Vision extraction complete: ${runners.length} runner(s) found`);
+    return { runners, raceInfo: mergedRaceInfo };
+
+  } catch (err) {
+    warn('Vision extraction failed:', err.message);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostic dump on failure
 // ---------------------------------------------------------------------------
 
@@ -924,15 +1125,27 @@ async function main() {
       if (!raceInfo[key]) raceInfo[key] = domRaceInfo[key];
     }
 
-    // ── Bail out with diagnostics if still empty ──────────────────────────
+    // ── Attempt 3: Claude Vision extraction ──────────────────────────────
     if (!runners.length) {
-      error('No runners found via API intercept or DOM scraping.');
+      warn('No runner data found via API intercept or DOM scraping — trying Claude Vision...');
+      const visionResult = await extractRunnersWithVision(page, raceInfo);
+      if (visionResult && visionResult.runners.length > 0) {
+        runners  = visionResult.runners;
+        raceInfo = visionResult.raceInfo;
+      }
+    }
+
+    // ── Bail out with diagnostics if all methods failed ───────────────────
+    if (!runners.length) {
+      error('No runners found via API intercept, DOM scraping, or Claude Vision.');
       error('Page title:', await page.title());
       error('Saving diagnostic files...');
       await saveDiagnostics(page, outputPath, capturedJson);
-      info('Check diagnostic.png and diagnostic.html in the output folder to inspect the page structure.');
+      info('Check diagnostic.png in the output folder to confirm the page loaded correctly.');
+      if (!process.env.ANTHROPIC_API_KEY) {
+        info('Tip: set ANTHROPIC_API_KEY to enable AI-powered vision extraction as a fallback.');
+      }
       if (capturedJson.length) {
-        info('Also check captured_api.json — the runner data may be there under an unexpected key.');
         info('API URLs captured:');
         capturedJson.forEach(r => info(' ', r.url));
       }
