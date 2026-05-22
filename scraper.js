@@ -185,33 +185,32 @@ function extractRaceInfoFromHtml($) {
   return info;
 }
 
-// Find the innermost element that contains an ALL-CAPS name AND a racing signal (weight/odds/barrier).
-// Avoids class-name dependency entirely.
+// Find runner containers using labeled fields as the racing signal.
+// Horse names on this site are title-case (e.g. "Itchintogo"), not ALL CAPS.
 function findRunnerContainers($) {
   const results = [];
   const seen = new WeakSet();
 
-  $('div, section, article, li').each(function() {
+  $('div, section, article, li, ul').each(function() {
     const $el = $(this);
     const text = $el.text();
 
-    if (!/[A-Z]{4,}/.test(text)) return;           // must have ALL CAPS text
-    if (text.trim().length < 30) return;             // too short
-    if (text.length > 5000) return;                  // too big — wrapper element
+    if (text.trim().length < 30) return;   // too short
+    if (text.length > 8000) return;        // wrapper element
 
+    // Racing signals: labeled fields that appear in every runner card
     const hasRacingSignal =
-      /\d{2}(\.\d)?\s*kg/i.test(text) ||            // weight
-      /\$\d+\.\d{2}/.test(text) ||                  // odds
-      /\bbarrier\b|\(B?\d{1,2}\)/i.test(text);      // barrier
+      /Trainer\s*:/i.test(text) ||
+      /Jockey\s*:/i.test(text)  ||
+      /Prize Money\s*:/i.test(text);
 
     if (!hasRacingSignal) return;
 
-    // Skip if a child also matches — we want the innermost matching element.
+    // Skip if a child also passes — keep the innermost match
     let childMatches = false;
     $el.children().each(function() {
       const ct = $(this).text();
-      if (/[A-Z]{4,}/.test(ct) &&
-          (/\d{2}(\.\d)?\s*kg/i.test(ct) || /\$\d+\.\d{2}/.test(ct))) {
+      if (/Trainer\s*:/i.test(ct) || /Jockey\s*:/i.test(ct)) {
         childMatches = true;
         return false;
       }
@@ -224,72 +223,78 @@ function findRunnerContainers($) {
   return results.length >= 2 && results.length <= 30 ? results : [];
 }
 
-// Parse a single runner element into structured data using text patterns.
+// Parse a single runner element into structured data.
+// Expected list format (each item is a <li>):
+//   "HorseName (barrier) formString"
+//   "Trainer: Name(Venue)"
+//   "Jockey: Name (Last 50: W-P-L)"
+//   "Weight: 57kg"
+//   "Prize Money: $237,300"
+//   "Win / Place: 40% / 60%"
 function extractRunnerFromElement($, el) {
   const $el = $(el);
   const text = $el.text();
 
   if (!text || text.trim().length < 10) return null;
 
-  // ── Number ────────────────────────────────────────────────────────────────
+  // ── Number from id attribute ──────────────────────────────────────────────
   const idNum = ($el.attr('id') || '').replace(/\D/g, '');
 
-  // ── Horse name: find direct-text-only ALL CAPS in element children ────────
-  let name = '';
-  $el.find('*').addBack().each(function() {
-    if (name) return false;
-    const directText = $(this).contents()
-      .filter((_, n) => n.type === 'text')
-      .text().trim();
-    if (/^[A-Z][A-Z\s'()]{3,28}$/.test(directText)) { name = directText; return false; }
-  });
-  // Broader regex fallback
-  if (!name) {
-    const m = text.match(/\b([A-Z][A-Z\s']{4,28})\b/);
-    if (m) name = m[1].trim();
-  }
-  if (!name || name.length < 3) return null;
+  // ── Collect all <li> texts for labeled-field extraction ───────────────────
+  const liTexts = $el.find('li').map((_, li) => $(li).text().trim()).toArray();
 
-  // ── Weight ────────────────────────────────────────────────────────────────
-  const wm = text.match(/(\d{2}(?:\.\d)?)\s*kg/i);
-  const weight = wm ? wm[1] + 'kg' : '';
+  // ── First <li>: "HorseName (barrier) formString" ─────────────────────────
+  const firstLi = liTexts[0] || '';
+  // Match: one or more title-case words, then (number), then digit/x sequence
+  const nbfMatch = firstLi.match(/^(.+?)\s+\((\d{1,2})\)\s+([0-9Xx]+)/);
+  let name    = nbfMatch ? nbfMatch[1].trim() : firstLi.replace(/\s*\(\d+\).*/, '').trim();
+  const barrier = nbfMatch ? nbfMatch[2] : '';
+  const form    = nbfMatch ? nbfMatch[3] : '';
 
-  // ── Barrier ───────────────────────────────────────────────────────────────
-  let barrier = '';
-  const bm = text.match(/[Bb]arrier\s*:?\s*(\d{1,2})|[Bb]r\.?\s*(\d{1,2})|\(B?(\d{1,2})\)/);
-  if (bm) barrier = bm[1] || bm[2] || bm[3] || '';
+  if (!name || name.length < 2) return null;
 
-  // ── Odds ──────────────────────────────────────────────────────────────────
-  const allOdds = [...text.matchAll(/\$(\d+\.\d{2})/g)].map(m => m[1]);
-  const winOdds   = allOdds[0] || '';
-  const placeOdds = allOdds[1] || '';
+  // ── Labeled fields ────────────────────────────────────────────────────────
+  // Strip parenthesised extras like "(Eagle Farm)" or "(Last 50: 9-5-3)"
+  const labelVal = (label) => {
+    const li = liTexts.find(t => new RegExp(`^${label}\\s*:`, 'i').test(t));
+    if (!li) return '';
+    return li.replace(new RegExp(`^${label}\\s*:\\s*`, 'i'), '')
+             .replace(/\s*\([^)]*\)\s*$/, '')  // strip trailing (...)
+             .trim();
+  };
 
-  // ── Form string ───────────────────────────────────────────────────────────
-  const fm = text.match(/\b([0-9Xx]{4,20})\b/);
-  const form = fm ? fm[1] : '';
+  const trainer    = labelVal('Trainer');
+  const weight     = labelVal('Weight');
+  const prizeMoney = labelVal('Prize Money');
 
-  // ── Jockey / Trainer ──────────────────────────────────────────────────────
-  const jockeyM  = text.match(/(?:Jockey|Ridden by|Rider)[:\s]+([A-Z][a-zA-Z.'\s-]{2,30}?)(?:\n|,|\s{2,}|$)/i);
-  const trainerM = text.match(/(?:Trainer|Trained by|T\.)[:\s]+([A-Z][a-zA-Z.'\s-]{2,30}?)(?:\n|,|\s{2,}|$)/i);
-  const jockey  = (jockeyM  ? jockeyM[1]  : '').trim();
-  const trainer = (trainerM ? trainerM[1] : '').trim();
+  // Jockey — strip trailing "(Last 50: ...)" stats
+  const jockeyRaw = labelVal('Jockey');
+  const jockey    = jockeyRaw.replace(/\s*\(Last\s+\d+[^)]*\)/i, '').trim();
+
+  // Win / Place: "40% / 60%"
+  const winPlaceLi = liTexts.find(t => /Win\s*\/\s*Place\s*:/i.test(t)) || '';
+  const wpMatch    = winPlaceLi.match(/([\d.]+%)\s*\/\s*([\d.]+%)/);
+  const winPct     = wpMatch ? wpMatch[1] : '';
+  const placePct   = wpMatch ? wpMatch[2] : '';
 
   // ── Career stats ──────────────────────────────────────────────────────────
-  let careerStarts = '', careerWins = '', careerSeconds = '', careerThirds = '', prizeMoney = '';
-  const cm = text.match(/(\d{1,3})[:\s-]+(\d{1,3})[:\s-]+(\d{1,3})[:\s-]+(\d{1,3})/);
+  // Pattern like "25: 5-4-3" or "25 5 4 3" somewhere in the text
+  let careerStarts = '', careerWins = '', careerSeconds = '', careerThirds = '';
+  const cm = text.match(/(\d{1,3})\s*[:\-]\s*(\d{1,3})\s*[:\-]\s*(\d{1,3})\s*[:\-]\s*(\d{1,3})/);
   if (cm) { careerStarts = cm[1]; careerWins = cm[2]; careerSeconds = cm[3]; careerThirds = cm[4]; }
-  const pm = text.match(/\$([\d,]+)/);
-  if (pm) prizeMoney = '$' + pm[1];
 
   // ── Age/sex/colour ────────────────────────────────────────────────────────
   const asm = text.match(/(\d+yo\s+(?:Bay|Brown|Chestnut|Grey|Black|Roan|Palomino|White)\s+(?:Gelding|Mare|Colt|Filly|Stallion|Horse))/i);
   const ageSexColour = asm ? asm[1] : '';
 
   // ── Sire / Dam ────────────────────────────────────────────────────────────
-  const sireM = text.match(/(?:Sire|By)[:\s]+([A-Z][a-zA-Z\s']{2,25}?)(?:\n|,|\s{2,}|$)/i);
-  const damM  = text.match(/(?:Dam|Mother)[:\s]+([A-Z][a-zA-Z\s']{2,25}?)(?:\n|,|\s{2,}|$)/i);
-  const sire = (sireM ? sireM[1] : '').trim();
-  const dam  = (damM  ? damM[1]  : '').trim();
+  const sire = labelVal('Sire');
+  const dam  = labelVal('Dam');
+
+  // ── Odds — dollar amounts ─────────────────────────────────────────────────
+  const allOdds = [...text.matchAll(/\$([\d.]+)/g)].map(m => m[1]).filter(v => v.includes('.'));
+  const winOdds   = allOdds[0] || '';
+  const placeOdds = allOdds[1] || '';
 
   // ── Race history ──────────────────────────────────────────────────────────
   const raceHistory = extractRaceHistoryFromElement($, $el);
@@ -303,7 +308,7 @@ function extractRunnerFromElement($, el) {
     barrier, jockey, trainer, weight, form,
     winOdds, placeOdds, ageSexColour, sire, dam, scratched,
     careerStarts, careerWins, careerSeconds, careerThirds,
-    prizeMoney, winPct: '', placePct: '',
+    prizeMoney, winPct, placePct,
     condStats: {}, raceHistory,
   };
 }
