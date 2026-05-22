@@ -10,6 +10,8 @@ const os        = require('os');
 let Anthropic = null;
 try { Anthropic = require('@anthropic-ai/sdk'); } catch { /* vision extraction unavailable */ }
 
+const cheerio = require('cheerio');
+
 const DEFAULT_OUTPUT   = 'C:\\tab\\scrape';
 const DEFAULT_DELAY_MS = 1000;
 
@@ -793,6 +795,248 @@ async function scrapeRunnersFromDom(page) {
 }
 
 // ---------------------------------------------------------------------------
+// HTML snapshot + cheerio extraction
+// ---------------------------------------------------------------------------
+
+async function saveHtmlSnapshot(page, outputPath) {
+  const html = await page.content();
+  fs.mkdirSync(outputPath, { recursive: true });
+  const htmlPath = path.join(outputPath, 'page_snapshot.html');
+  fs.writeFileSync(htmlPath, html, 'utf8');
+  info(`Page HTML saved: ${htmlPath} (${(html.length / 1024).toFixed(0)} KB)`);
+  return html;
+}
+
+function extractRaceInfoFromHtml($) {
+  const text = $('body').text();
+  const info = {};
+
+  for (const sel of ['h1','h2','[class*="race-name" i]','[class*="race-title" i]']) {
+    const el = $(sel).first();
+    if (el.length) { const t = el.text().trim(); if (t.length > 2 && t.length < 80) { info.raceName = t; break; } }
+  }
+
+  const raceNumM = text.match(/\bRace\s*(\d+)\b/i);
+  if (raceNumM) info.raceNum = raceNumM[1];
+
+  const distM = text.match(/\b(\d{3,4}m)\b/i);
+  if (distM) info.distance = distM[1];
+
+  const condM = text.match(/\b(Firm\s*\d*|Good\s*\d*|Soft\s*\d*|Heavy\s*\d*|Synthetic|Wet\s*\d*)\b/i);
+  if (condM) info.trackCondition = condM[1].trim();
+
+  const clsM = text.match(/\b(G[123]|Group\s*[123]|Listed|BM\s*\d+|Benchmark\s*\d+|MDN|Maiden|Handicap|Open|WFA|CL\d+)\b/i);
+  if (clsM) info.raceClass = clsM[1].trim();
+
+  for (const pat of [
+    /\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4})\b/i,
+    /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})\b/,
+    /\b(\d{4}-\d{2}-\d{2})\b/,
+  ]) {
+    const m = text.match(pat);
+    if (m) { info.date = m[1]; break; }
+  }
+
+  return info;
+}
+
+// Find the innermost element that contains an ALL-CAPS name AND a racing signal (weight/odds/barrier).
+// Avoids class-name dependency entirely.
+function findRunnerContainers($) {
+  const results = [];
+  const seen = new WeakSet();
+
+  $('div, section, article, li').each(function() {
+    const $el = $(this);
+    const text = $el.text();
+
+    if (!/[A-Z]{4,}/.test(text)) return;           // must have ALL CAPS text
+    if (text.trim().length < 30) return;             // too short
+    if (text.length > 5000) return;                  // too big — wrapper element
+
+    const hasRacingSignal =
+      /\d{2}(\.\d)?\s*kg/i.test(text) ||            // weight
+      /\$\d+\.\d{2}/.test(text) ||                  // odds
+      /\bbarrier\b|\(B?\d{1,2}\)/i.test(text);      // barrier
+
+    if (!hasRacingSignal) return;
+
+    // Skip if a child also matches — we want the innermost matching element.
+    let childMatches = false;
+    $el.children().each(function() {
+      const ct = $(this).text();
+      if (/[A-Z]{4,}/.test(ct) &&
+          (/\d{2}(\.\d)?\s*kg/i.test(ct) || /\$\d+\.\d{2}/.test(ct))) {
+        childMatches = true;
+        return false;
+      }
+    });
+    if (childMatches) return;
+
+    if (!seen.has(this)) { seen.add(this); results.push(this); }
+  });
+
+  return results.length >= 2 && results.length <= 30 ? results : [];
+}
+
+// Parse a single runner element into structured data using text patterns.
+function extractRunnerFromElement($, el) {
+  const $el = $(el);
+  const text = $el.text();
+
+  if (!text || text.trim().length < 10) return null;
+
+  // ── Number ────────────────────────────────────────────────────────────────
+  const idNum = ($el.attr('id') || '').replace(/\D/g, '');
+
+  // ── Horse name: find direct-text-only ALL CAPS in element children ────────
+  let name = '';
+  $el.find('*').addBack().each(function() {
+    if (name) return false;
+    const directText = $(this).contents()
+      .filter((_, n) => n.type === 'text')
+      .text().trim();
+    if (/^[A-Z][A-Z\s'()]{3,28}$/.test(directText)) { name = directText; return false; }
+  });
+  // Broader regex fallback
+  if (!name) {
+    const m = text.match(/\b([A-Z][A-Z\s']{4,28})\b/);
+    if (m) name = m[1].trim();
+  }
+  if (!name || name.length < 3) return null;
+
+  // ── Weight ────────────────────────────────────────────────────────────────
+  const wm = text.match(/(\d{2}(?:\.\d)?)\s*kg/i);
+  const weight = wm ? wm[1] + 'kg' : '';
+
+  // ── Barrier ───────────────────────────────────────────────────────────────
+  let barrier = '';
+  const bm = text.match(/[Bb]arrier\s*:?\s*(\d{1,2})|[Bb]r\.?\s*(\d{1,2})|\(B?(\d{1,2})\)/);
+  if (bm) barrier = bm[1] || bm[2] || bm[3] || '';
+
+  // ── Odds ──────────────────────────────────────────────────────────────────
+  const allOdds = [...text.matchAll(/\$(\d+\.\d{2})/g)].map(m => m[1]);
+  const winOdds   = allOdds[0] || '';
+  const placeOdds = allOdds[1] || '';
+
+  // ── Form string ───────────────────────────────────────────────────────────
+  const fm = text.match(/\b([0-9Xx]{4,20})\b/);
+  const form = fm ? fm[1] : '';
+
+  // ── Jockey / Trainer ──────────────────────────────────────────────────────
+  const jockeyM  = text.match(/(?:Jockey|Ridden by|Rider)[:\s]+([A-Z][a-zA-Z.'\s-]{2,30}?)(?:\n|,|\s{2,}|$)/i);
+  const trainerM = text.match(/(?:Trainer|Trained by|T\.)[:\s]+([A-Z][a-zA-Z.'\s-]{2,30}?)(?:\n|,|\s{2,}|$)/i);
+  const jockey  = (jockeyM  ? jockeyM[1]  : '').trim();
+  const trainer = (trainerM ? trainerM[1] : '').trim();
+
+  // ── Career stats ──────────────────────────────────────────────────────────
+  let careerStarts = '', careerWins = '', careerSeconds = '', careerThirds = '', prizeMoney = '';
+  const cm = text.match(/(\d{1,3})[:\s-]+(\d{1,3})[:\s-]+(\d{1,3})[:\s-]+(\d{1,3})/);
+  if (cm) { careerStarts = cm[1]; careerWins = cm[2]; careerSeconds = cm[3]; careerThirds = cm[4]; }
+  const pm = text.match(/\$([\d,]+)/);
+  if (pm) prizeMoney = '$' + pm[1];
+
+  // ── Age/sex/colour ────────────────────────────────────────────────────────
+  const asm = text.match(/(\d+yo\s+(?:Bay|Brown|Chestnut|Grey|Black|Roan|Palomino|White)\s+(?:Gelding|Mare|Colt|Filly|Stallion|Horse))/i);
+  const ageSexColour = asm ? asm[1] : '';
+
+  // ── Sire / Dam ────────────────────────────────────────────────────────────
+  const sireM = text.match(/(?:Sire|By)[:\s]+([A-Z][a-zA-Z\s']{2,25}?)(?:\n|,|\s{2,}|$)/i);
+  const damM  = text.match(/(?:Dam|Mother)[:\s]+([A-Z][a-zA-Z\s']{2,25}?)(?:\n|,|\s{2,}|$)/i);
+  const sire = (sireM ? sireM[1] : '').trim();
+  const dam  = (damM  ? damM[1]  : '').trim();
+
+  // ── Race history ──────────────────────────────────────────────────────────
+  const raceHistory = extractRaceHistoryFromElement($, $el);
+
+  // ── Scratched ─────────────────────────────────────────────────────────────
+  const scratched = /\bscratched\b|\bSCR\b/i.test(text);
+
+  return {
+    number: idNum,
+    name:   name.replace(/\s+/g, ' ').trim(),
+    barrier, jockey, trainer, weight, form,
+    winOdds, placeOdds, ageSexColour, sire, dam, scratched,
+    careerStarts, careerWins, careerSeconds, careerThirds,
+    prizeMoney, winPct: '', placePct: '',
+    condStats: {}, raceHistory,
+  };
+}
+
+function extractRaceHistoryFromElement($, $el) {
+  const history = [];
+
+  // Try table rows
+  $el.find('tr').each(function() {
+    const cells = $(this).find('td, th')
+      .map((_, td) => $(td).text().trim()).toArray().filter(Boolean);
+    if (cells.length >= 3) history.push(parseHistRow(cells));
+  });
+  if (history.length) return history;
+
+  // Try structured row-like elements
+  $el.find('[class*="row" i],[class*="item" i],[class*="entry" i],[class*="start" i],[class*="run" i]').each(function() {
+    const leafTexts = $(this).find('span, p, b, strong').map((_, leaf) => {
+      return $(leaf).contents().filter((_, n) => n.type === 'text').text().trim();
+    }).toArray().filter(Boolean);
+    if (leafTexts.length >= 3) history.push(parseHistRow(leafTexts));
+  });
+
+  return history;
+}
+
+function parseHistRow(cells) {
+  const row = { raw: cells.join(' | ') };
+  for (const c of cells) {
+    if (!row.date      && /\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}/.test(c)) { row.date = c; continue; }
+    if (!row.distance  && /^\d{3,4}m$/i.test(c))                           { row.distance = c; continue; }
+    if (!row.condition && /^(Firm|Good|Soft|Heavy|Syn|Wet)\d*$/i.test(c))  { row.condition = c; continue; }
+    if (!row.raceClass && /^(G[123]|Listed|BM\d+|MDN|CL\d+|Hcp|WFA)/i.test(c)) { row.raceClass = c; continue; }
+    if (!row.position  && /^\d{1,2}(st|nd|rd|th)?$/i.test(c))             { row.position = c; continue; }
+    if (!row.margin    && /^(\d+(\.\d+)?L|SH|NK|HD|NS|NECK|HEAD)$/i.test(c)) { row.margin = c; continue; }
+    if (!row.time      && /^\d:\d{2}\.\d{1,2}$/.test(c))                  { row.time = c; continue; }
+    if (!row.weight    && /^\d{2}(\.\d)?$/.test(c) && +c >= 48 && +c <= 65) { row.weight = c; continue; }
+    if (!row.odds      && /^\$?[\d]+\.?\d{0,2}$/.test(c))                 { row.odds = c.replace('$', ''); }
+  }
+  for (const c of cells) {
+    if (!row.venue && /^[A-Z][a-z]+(\s[A-Z][a-z]+)?$/.test(c.trim()) && c.length < 25) {
+      row.venue = c.trim(); break;
+    }
+  }
+  return row;
+}
+
+function extractRunnersFromHtml(html) {
+  const $ = cheerio.load(html);
+
+  // ── Strategy 1: ID-based selectors ────────────────────────────────────────
+  const idPatterns = [
+    '[id^="runner-"]', '[id^="Runner-"]',
+    '[id^="competitor-"]', '[id^="horse-"]',
+    '[id^="entry-"]', '[id^="field-"]',
+  ];
+  for (const pat of idPatterns) {
+    const els = $(pat).toArray();
+    if (els.length >= 2) {
+      info(`cheerio: found ${els.length} elements via ${pat}`);
+      const runners = els.map(el => extractRunnerFromElement($, el)).filter(r => r && r.name.length >= 2);
+      if (runners.length >= 2) return { runners, raceInfo: extractRaceInfoFromHtml($) };
+    }
+  }
+
+  // ── Strategy 2: Structural analysis ───────────────────────────────────────
+  const els = findRunnerContainers($);
+  if (els.length >= 2) {
+    info(`cheerio: found ${els.length} runner containers via structural analysis`);
+    const runners = els.map(el => extractRunnerFromElement($, el)).filter(r => r && r.name.length >= 2);
+    if (runners.length >= 2) return { runners, raceInfo: extractRaceInfoFromHtml($) };
+  }
+
+  warn('cheerio: no runner containers found');
+  return { runners: [], raceInfo: extractRaceInfoFromHtml($) };
+}
+
+// ---------------------------------------------------------------------------
 // Claude Vision extraction
 // ---------------------------------------------------------------------------
 
@@ -1327,9 +1571,26 @@ async function main() {
       }
     }
 
-    // ── Attempt 4: DOM scraping ───────────────────────────────────────────
+    // ── Save full rendered HTML (always — useful for inspection) ─────────
+    info('Saving rendered HTML snapshot...');
+    const snapshotHtml = await saveHtmlSnapshot(page, outputPath);
+
+    // ── Attempt 4: cheerio extraction from saved HTML ─────────────────────
     if (!runners.length) {
-      warn('No API data found — falling back to DOM scraping...');
+      warn('No API/state data found — trying cheerio extraction from HTML snapshot...');
+      const cheerioResult = extractRunnersFromHtml(snapshotHtml);
+      if (cheerioResult.runners.length >= 2) {
+        info(`cheerio extracted ${cheerioResult.runners.length} runner(s)`);
+        runners  = cheerioResult.runners;
+        for (const [k, v] of Object.entries(cheerioResult.raceInfo)) {
+          if (v && !raceInfo[k]) raceInfo[k] = v;
+        }
+      }
+    }
+
+    // ── Attempt 5: in-browser DOM scraping ───────────────────────────────
+    if (!runners.length) {
+      warn('cheerio found nothing — falling back to in-browser DOM scraping...');
       runners = await scrapeRunnersFromDom(page);
     }
 
@@ -1339,7 +1600,7 @@ async function main() {
       if (!raceInfo[key]) raceInfo[key] = domRaceInfo[key];
     }
 
-    // ── Attempt 5: Claude Vision (last resort) ────────────────────────────
+    // ── Attempt 6: Claude Vision (last resort) ────────────────────────────
     if (!runners.length) {
       warn('All structural extraction failed — trying Claude Vision as last resort...');
       const visionResult = await extractRunnersWithVision(page, raceInfo);
