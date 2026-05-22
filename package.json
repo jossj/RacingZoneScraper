@@ -1,14 +1,13 @@
 {
-  "name": "racing-zone-scraper",
-  "version": "1.0.0",
-  "description": "Scrapes TAB race pages and RacingZone horse statistics into Excel",
+  "name": "ladbrokes-form-scraper",
+  "version": "2.0.0",
+  "description": "Scrapes Ladbrokes form guide pages into an Excel spreadsheet",
   "main": "scraper.js",
   "scripts": {
     "start": "node scraper.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
-    "puppeteer": "^25.0.4",
-    "tesseract.js": "^7.0.0"
+    "puppeteer": "^25.0.4"
   }
 }

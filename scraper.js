@@ -1,16 +1,14 @@
 'use strict';
 
-const puppeteer          = require('puppeteer');
-const ExcelJS            = require('exceljs');
-const readline           = require('readline');
-const path               = require('path');
-const fs                 = require('fs');
-const os                 = require('os');
-const { createWorker }   = require('tesseract.js');
+const puppeteer = require('puppeteer');
+const ExcelJS   = require('exceljs');
+const readline  = require('readline');
+const path      = require('path');
+const fs        = require('fs');
+const os        = require('os');
 
-const RACINGZONE_HORSES_URL = 'https://www.racingzone.com.au/horses/';
-const DEFAULT_OUTPUT        = 'C:\\tab\\scrape';
-const DEFAULT_DELAY_MS      = 2000;
+const DEFAULT_OUTPUT   = 'C:\\tab\\scrape';
+const DEFAULT_DELAY_MS = 1000;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -47,15 +45,15 @@ function prompt(question) {
 
 async function promptForUrl() {
   console.log('\n' + '='.repeat(60));
-  console.log('  Horse Racing Scraper');
+  console.log('  Ladbrokes Form Guide Scraper');
   console.log('='.repeat(60));
-  console.log('Paste the full URL of the TAB race page and press Enter.');
-  console.log('Example: https://www.tab.com.au/racing/2026-05-18/RANDWICK/NSW/R/1');
+  console.log('Paste the Ladbrokes form guide URL and press Enter.');
+  console.log('Example: https://ladbrokesform.com.au/form/ba59f0cc-ece5-47fa-9b61-31f8b37ea042');
   console.log();
 
   let url = '';
   while (!url.startsWith('http')) {
-    url = await prompt('TAB race URL: ');
+    url = await prompt('Form guide URL: ');
     if (!url.startsWith('http')) console.log('  Please enter a valid URL starting with http.');
   }
   return url;
@@ -74,612 +72,560 @@ function resolveOutputPath(raw) {
   return raw.replace(/\\/g, '/');
 }
 
-// ---------------------------------------------------------------------------
-// TAB helpers
-// ---------------------------------------------------------------------------
-
-async function waitForRunners(page, timeout = 30000) {
-  await page.waitForSelector('.runner-name', { timeout });
+async function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
-async function clickShowAllForm(page) {
-  const sel = "[class*='show-all-form'] button, .show-all-form-wrapper button";
-  try {
-    await page.waitForSelector(sel, { timeout: 10000 });
-    const btn = await page.$(sel);
-    if (btn) {
-      const text = await page.evaluate(el => el.textContent, btn);
-      if (!text.includes('Hide')) {
-        await btn.click();
-        await sleep(4000);
-        info('"Show All Form" expanded.');
-        return;
-      }
-      info('Form already expanded — skipping click.');
-    }
-  } catch {
-    warn('"Show All Form" button not found — trying individual expand buttons.');
-    await expandIndividualForms(page);
+// ---------------------------------------------------------------------------
+// Page helpers
+// ---------------------------------------------------------------------------
+
+async function scrollPage(page) {
+  await page.evaluate(async () => {
+    await new Promise(resolve => {
+      let total = 0;
+      const step = 800;
+      const timer = setInterval(() => {
+        window.scrollBy(0, step);
+        total += step;
+        if (total >= document.body.scrollHeight) {
+          clearInterval(timer);
+          window.scrollTo(0, 0);
+          resolve();
+        }
+      }, 120);
+    });
+  });
+  await sleep(1000);
+}
+
+async function waitForContent(page) {
+  const selectors = [
+    '[id^="runner-"]',
+    '[class*="runner-card"]',
+    '[class*="RunnerCard"]',
+    '[class*="runner-row"]',
+    '[class*="RunnerRow"]',
+    '[class*="competitor"]',
+    '[class*="Competitor"]',
+    '[class*="form-runner"]',
+  ];
+  for (const sel of selectors) {
+    try {
+      await page.waitForSelector(sel, { timeout: 8000 });
+      info(`Content detected via: ${sel}`);
+      return sel;
+    } catch { /* try next */ }
+  }
+  warn('Could not detect runner elements — scraping anyway after delay');
+  await sleep(5000);
+  return null;
+}
+
+async function dismissOverlays(page) {
+  // Dismiss cookie banners, login modals, age verification, etc.
+  const overlayBtns = [
+    '[class*="cookie"] button[class*="accept"]',
+    '[class*="cookie"] button[class*="close"]',
+    '[class*="cookie"] button[class*="agree"]',
+    '[id*="cookie"] button',
+    '[class*="modal"] button[class*="close"]',
+    '[aria-label*="close" i]',
+    '[aria-label*="accept" i]',
+    'button[class*="dismiss"]',
+    'button[class*="consent"]',
+  ];
+  for (const sel of overlayBtns) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) { await btn.click(); await sleep(500); info(`Dismissed overlay: ${sel}`); }
+    } catch { /* ignore */ }
   }
 }
 
-async function expandIndividualForms(page) {
-  try {
-    const btns = await page.$$(
-      "[class*='form-toggle'] button, [class*='expand-form'] button"
-    );
-    for (const btn of btns) {
-      try {
-        const text = await page.evaluate(el => el.textContent, btn);
-        if (!text.includes('Hide')) {
-          await page.evaluate(el => el.click(), btn);
-          await sleep(300);
-        }
-      } catch { /* ignore */ }
+async function expandAllRunners(page) {
+  // Click all "Show Form" / "Expand" toggles so full form details are visible
+  const expanded = await page.evaluate(() => {
+    let count = 0;
+    const toggles = [
+      ...document.querySelectorAll('[aria-expanded="false"]'),
+      ...document.querySelectorAll('[class*="expand"]:not([class*="expanded"])'),
+      ...document.querySelectorAll('[class*="show-form"]'),
+      ...document.querySelectorAll('[class*="toggle"][class*="form"]'),
+    ];
+    // Deduplicate
+    const seen = new Set();
+    for (const el of toggles) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      try { el.click(); count++; } catch { /* ignore */ }
     }
+    return count;
+  });
+  if (expanded > 0) {
+    info(`Clicked ${expanded} expand toggle(s)`);
     await sleep(2000);
-    info(`Expanded ${btns.length} individual form panels.`);
-  } catch { /* ignore */ }
+  }
 }
 
-async function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+// ---------------------------------------------------------------------------
+// Try to extract structured JSON data embedded by Next.js / Nuxt / etc.
+// ---------------------------------------------------------------------------
+
+async function tryExtractEmbeddedData(page) {
+  return page.evaluate(() => {
+    // Next.js
+    if (window.__NEXT_DATA__) {
+      try { return { source: 'next', data: window.__NEXT_DATA__ }; } catch { /* ignore */ }
+    }
+    // Nuxt
+    if (window.__NUXT__) {
+      try { return { source: 'nuxt', data: window.__NUXT__ }; } catch { /* ignore */ }
+    }
+    // Common SPA state keys
+    for (const key of ['__INITIAL_STATE__', '__PRELOADED_STATE__', '__APP_STATE__', '__DATA__']) {
+      if (window[key]) {
+        try { return { source: key, data: window[key] }; } catch { /* ignore */ }
+      }
+    }
+    // Look for <script id="__NEXT_DATA__"> tags
+    const el = document.querySelector('#__NEXT_DATA__');
+    if (el) {
+      try { return { source: 'script-tag', data: JSON.parse(el.textContent) }; } catch { /* ignore */ }
+    }
+    return null;
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Race info
 // ---------------------------------------------------------------------------
 
-function parseUrlMeta(url) {
-  const meta = { url };
-  // e.g. /racing/2026-05-18/RANDWICK/NSW/R/3
-  const m = url.match(/racing\/(\d{4}-\d{2}-\d{2})\/([A-Z0-9_-]+)\/[A-Z]+\/[RGH]\/(\d+)/i);
-  if (m) { meta.date = m[1]; meta.venue = m[2].replace(/-/g, ' '); meta.raceNum = m[3]; }
-  return meta;
-}
+async function getRaceInfo(page, url) {
+  return page.evaluate((pageUrl) => {
+    const info = { url: pageUrl, raceName: '', venue: '', date: '', raceNum: '', distance: '', raceClass: '', trackCondition: '' };
 
-async function getRaceInfo(page) {
-  const url  = page.url();
-  const meta = parseUrlMeta(url);
+    const bodyText = document.body.innerText || '';
 
-  Object.assign(meta, await page.evaluate(() => {
-    const result = { raceName: '', bannerDetails: '', trackCondition: '' };
-
-    // Race name
-    for (const h of document.querySelectorAll('h1,h2,h3,h4')) {
-      const t = h.textContent.trim();
-      if (t.length > 5 && !/TAB|Racing/i.test(t)) {
-        result.raceName = t.replace(/\s*-\s*Betting Odds$/i, '').trim();
-        break;
+    // Venue - look for common Australian track names or header text
+    const venueSelectors = [
+      '[class*="venue"]', '[class*="Venue"]',
+      '[class*="meeting-name"]', '[class*="MeetingName"]',
+      '[class*="track-name"]', '[class*="TrackName"]',
+      'h1', 'h2',
+    ];
+    for (const sel of venueSelectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        const t = el.textContent.trim();
+        if (t.length > 2 && t.length < 60) { info.raceName = t; break; }
       }
     }
 
-    // Banner
-    result.bannerDetails = [...document.querySelectorAll(
-      "banner li, [class*='race-info'] li, [class*='race-detail'] li"
-    )].map(e => e.textContent.trim()).filter(Boolean).slice(0, 10).join(' | ');
+    // Race number
+    const raceNumMatch = bodyText.match(/\bRace\s*(\d+)\b/i);
+    if (raceNumMatch) info.raceNum = raceNumMatch[1];
+
+    // Distance
+    const distMatch = bodyText.match(/\b(\d{3,4}m)\b/i);
+    if (distMatch) info.distance = distMatch[1];
+
+    // Date — multiple formats
+    const datePatterns = [
+      /\b(\d{1,2}[\s\-\/]\w{3,9}[\s\-\/]\d{4})\b/,
+      /\b(\w{3,9}[\s\-\/]\d{1,2}[\s\-\/,]\s*\d{4})\b/,
+      /\b(\d{4}-\d{2}-\d{2})\b/,
+      /\b(\d{1,2}\/\d{1,2}\/\d{2,4})\b/,
+    ];
+    for (const pat of datePatterns) {
+      const m = bodyText.match(pat);
+      if (m) { info.date = m[1]; break; }
+    }
 
     // Track condition
-    result.trackCondition = [...document.querySelectorAll(
-      "[class*='track-condition'], [class*='condition']"
-    )].map(e => e.textContent.trim()).filter(Boolean).join(' ');
+    const condMatch = bodyText.match(/\b(Firm\s*\d*|Good\s*\d*|Soft\s*\d*|Heavy\s*\d*|Synthetic|Wet\s*\d*)\b/i);
+    if (condMatch) info.trackCondition = condMatch[1].trim();
 
-    return result;
-  }));
+    // Race class
+    const classMatch = bodyText.match(/\b(G[123]|Group\s*[123]|Listed|BM\s*\d+|Benchmark\s*\d+|MDN|Maiden|Handicap|Open|3YO|4YO|2YO|3-4YO|WFA|CL\d+|NMW)\b/i);
+    if (classMatch) info.raceClass = classMatch[1].trim();
 
-  return meta;
+    // Collect detail items from likely header elements
+    const detailEls = document.querySelectorAll(
+      '[class*="race-info"] *,' +
+      '[class*="RaceInfo"] *,' +
+      '[class*="race-detail"] *,' +
+      '[class*="RaceDetail"] *,' +
+      '[class*="race-header"] *,' +
+      '[class*="RaceHeader"] *'
+    );
+    const details = [...detailEls]
+      .map(e => e.textContent.trim())
+      .filter(t => t.length > 1 && t.length < 80 && !t.includes('\n'))
+      .slice(0, 15);
+    info.details = details.join(' | ');
+
+    return info;
+  }, url);
 }
 
 // ---------------------------------------------------------------------------
-// Runners
+// Runner scraping
 // ---------------------------------------------------------------------------
 
 async function scrapeRunners(page) {
+  // First: expand any collapsed form sections
+  await expandAllRunners(page);
+
   return page.evaluate(() => {
-    const rows = [...document.querySelectorAll('.row')]
-      .filter(r => r.querySelector('.runner-name'));
+    const results = [];
 
-    return rows.map(row => {
-      // Number / cloth
-      const numEl = row.querySelector('.number-cell, [class*="number"], [class*="silk"]');
-      const number = numEl ? numEl.textContent.trim() : '';
+    // ── Find runner container elements ────────────────────────────────────────
+    const containerCandidates = [
+      // id-based (matches #runner-N fragment pattern in URL)
+      [...document.querySelectorAll('[id^="runner-"]')],
+      // class-based
+      [...document.querySelectorAll('[class*="runner-card"], [class*="RunnerCard"]')],
+      [...document.querySelectorAll('[class*="runner-row"], [class*="RunnerRow"]')],
+      [...document.querySelectorAll('[class*="runner-item"], [class*="RunnerItem"]')],
+      [...document.querySelectorAll('[class*="competitor-row"], [class*="CompetitorRow"]')],
+      [...document.querySelectorAll('[class*="form-runner"], [class*="FormRunner"]')],
+      // fallback: any element containing both a horse name indicator and jockey/trainer
+      [...document.querySelectorAll('[class*="runner"]')]
+        .filter(el => el.textContent.length > 30 && !el.querySelector('[class*="runner"]')),
+    ];
 
-      // Horse name — strip nested span text
-      let name = '';
-      const nameEl = row.querySelector('.runner-name');
-      if (nameEl) {
-        const nested = [...nameEl.querySelectorAll('span, .barrier, .box')]
-          .map(n => n.textContent).join('');
-        name = nameEl.textContent.replace(nested, '').trim();
+    let runnerEls = [];
+    for (const cands of containerCandidates) {
+      if (cands.length >= 2) { runnerEls = cands; break; }
+    }
+
+    if (!runnerEls.length) return results;
+
+    // Helper: get first non-empty text from a list of selectors within a root
+    const getText = (root, sels) => {
+      for (const s of sels) {
+        try {
+          const el = root.querySelector(s);
+          if (el) {
+            const t = el.textContent.trim();
+            if (t) return t;
+          }
+        } catch { /* bad selector, ignore */ }
+      }
+      return '';
+    };
+
+    // Helper: get all matching texts
+    const getAll = (root, sel) => {
+      try {
+        return [...root.querySelectorAll(sel)].map(e => e.textContent.trim()).filter(Boolean);
+      } catch { return []; }
+    };
+
+    for (const el of runnerEls) {
+      const elText = el.textContent || '';
+      if (elText.length < 10) continue;
+
+      // ── Number ────────────────────────────────────────────────────────────
+      const number = getText(el, [
+        '[class*="runner-number"]', '[class*="RunnerNumber"]',
+        '[class*="saddle-cloth"]', '[class*="SaddleCloth"]',
+        '[class*="cloth-number"]', '[class*="ClothNumber"]',
+        '[class*="competitor-number"]', '[class*="number"]',
+      ]);
+
+      // ── Horse name ────────────────────────────────────────────────────────
+      const name = getText(el, [
+        '[class*="horse-name"]', '[class*="HorseName"]',
+        '[class*="runner-name"]', '[class*="RunnerName"]',
+        '[class*="competitor-name"]', '[class*="CompetitorName"]',
+        '[class*="animal-name"]',
+        'h1', 'h2', 'h3',
+      ]);
+
+      if (!name || name.length < 2) continue;
+
+      // ── Barrier ───────────────────────────────────────────────────────────
+      const barrier = getText(el, [
+        '[class*="barrier"]', '[class*="Barrier"]',
+        '[class*="gate"]', '[class*="Gate"]',
+        '[class*="draw"]', '[class*="Draw"]',
+      ]);
+
+      // ── Jockey ────────────────────────────────────────────────────────────
+      const jockey = getText(el, [
+        '[class*="jockey-name"]', '[class*="JockeyName"]',
+        '[class*="jockey"]', '[class*="Jockey"]',
+        '[class*="rider"]', '[class*="Rider"]',
+        '[class*="driver"]', '[class*="Driver"]',
+      ]);
+
+      // ── Trainer ───────────────────────────────────────────────────────────
+      const trainer = getText(el, [
+        '[class*="trainer-name"]', '[class*="TrainerName"]',
+        '[class*="trainer"]', '[class*="Trainer"]',
+      ]);
+
+      // ── Weight ────────────────────────────────────────────────────────────
+      const weight = getText(el, [
+        '[class*="weight"]', '[class*="Weight"]',
+        '[class*="handicap"]', '[class*="Handicap"]',
+        '[class*="kg"]',
+      ]);
+
+      // ── Form string ───────────────────────────────────────────────────────
+      const form = getText(el, [
+        '[class*="form-string"]', '[class*="FormString"]',
+        '[class*="form-figures"]', '[class*="FormFigures"]',
+        '[class*="last-starts"]', '[class*="LastStarts"]',
+        '[class*="form-guide"]',  '[class*="FormGuide"]',
+        '[class*="recent-form"]', '[class*="RecentForm"]',
+        '[class*="form-numbers"]','[class*="FormNumbers"]',
+      ]);
+
+      // ── Odds ──────────────────────────────────────────────────────────────
+      const oddsEls = getAll(el, [
+        '[class*="price"]', '[class*="Price"]',
+        '[class*="odds"]',  '[class*="Odds"]',
+        'button[class*="bet"]',
+      ].join(', '));
+
+      let winOdds   = '';
+      let placeOdds = '';
+      // Odds are usually the first two price buttons/spans
+      const oddsNums = oddsEls
+        .map(t => t.replace(/[^\d.$]/g, '').trim())
+        .filter(t => /^\$?[\d]+\.?\d*$/.test(t));
+      if (oddsNums[0]) winOdds   = oddsNums[0];
+      if (oddsNums[1]) placeOdds = oddsNums[1];
+
+      // Also try more specific win/place selectors
+      const winEl   = getText(el, ['[class*="win-price"]','[class*="WinPrice"]','[class*="win-odds"]','[class*="WinOdds"]','[class*="fixed-win"]']);
+      const placeEl = getText(el, ['[class*="place-price"]','[class*="PlacePrice"]','[class*="place-odds"]','[class*="PlaceOdds"]','[class*="fixed-place"]']);
+      if (winEl)   winOdds   = winEl;
+      if (placeEl) placeOdds = placeEl;
+
+      // ── Career stats ──────────────────────────────────────────────────────
+      const careerText = getText(el, [
+        '[class*="career-stats"]', '[class*="CareerStats"]',
+        '[class*="career-record"]','[class*="CareerRecord"]',
+        '[class*="career"]',       '[class*="Career"]',
+        '[class*="stats"]',        '[class*="Stats"]',
+      ]);
+
+      // Parse career: "20: 5-4-3 $125,000" or "20 5 4 3" etc.
+      let careerStarts = '', careerWins = '', careerSeconds = '', careerThirds = '', prizeMoney = '';
+      if (careerText) {
+        const prizeMatch = careerText.match(/\$[\d,]+/);
+        if (prizeMatch) prizeMoney = prizeMatch[0];
+        const numsMatch = careerText.match(/(\d+)\D+(\d+)\D+(\d+)\D+(\d+)/);
+        if (numsMatch) {
+          careerStarts  = numsMatch[1];
+          careerWins    = numsMatch[2];
+          careerSeconds = numsMatch[3];
+          careerThirds  = numsMatch[4];
+        }
       }
 
-      // Jockey + Trainer
-      const fullNames = [...row.querySelectorAll('.runner-metadata-list .full-name')];
-      const jockey  = fullNames[0] ? fullNames[0].textContent.trim() : '';
-      const trainer = fullNames[1] ? fullNames[1].textContent.trim() : '';
+      // Win % and Place %
+      const winPct   = (elText.match(/Win[s]?\s*[:%]\s*([\d.]+\s*%?)/i)   || [])[1] || '';
+      const placePct = (elText.match(/Place[s]?\s*[:%]\s*([\d.]+\s*%?)/i) || [])[1] || '';
 
-      // Form / Weight / Rating
-      const dts = [...row.querySelectorAll('.runner-metadata-list.optional dt')];
-      const dds = [...row.querySelectorAll('.runner-metadata-list.optional dd')];
-      const meta = {};
-      dts.forEach((k, i) => { if (dds[i]) meta[k.textContent.trim()] = dds[i].textContent.trim(); });
+      // ── Condition stats ───────────────────────────────────────────────────
+      // Collect label:value pairs from stats sections
+      const condStats = {};
+      const statRows = el.querySelectorAll('[class*="stat-row"],[class*="StatRow"],[class*="condition-row"],[class*="ConditionRow"]');
+      for (const row of statRows) {
+        const label = getText(row, ['[class*="label"]','[class*="Label"]','dt','th']);
+        const value = getText(row, ['[class*="value"]','[class*="Value"]','dd','td']);
+        if (label && value) condStats[label] = value;
+      }
 
-      // Odds
-      const prices = [...row.querySelectorAll('.price-cell')].map(p => p.textContent.trim());
+      // Also look for dt/dd pairs
+      const dts = [...el.querySelectorAll('dt')];
+      const dds = [...el.querySelectorAll('dd')];
+      dts.forEach((dt, i) => {
+        if (dds[i]) condStats[dt.textContent.trim()] = dds[i].textContent.trim();
+      });
 
-      const winOdds   = prices[0] || '';
-      const placeOdds = prices[1] || '';
+      // Extract common condition categories from text if structured data missing
+      const conditionKeys = [
+        ['Distance', /Distance[:\s]+([\d\w\s%\-\/]+)/i],
+        ['Track',    /Track[:\s]+([\d\w\s%\-\/]+)/i],
+        ['Firm',     /Firm[:\s]+([\d\w\s%\-\/]+)/i],
+        ['Good',     /Good[:\s]+([\d\w\s%\-\/]+)/i],
+        ['Soft',     /Soft[:\s]+([\d\w\s%\-\/]+)/i],
+        ['Heavy',    /Heavy[:\s]+([\d\w\s%\-\/]+)/i],
+        ['Barrier',  /Barrier[:\s]+([\d\w\s%\-\/]+)/i],
+        ['1st Up',   /1st\s*Up[:\s]+([\d\w\s%\-\/]+)/i],
+        ['2nd Up',   /2nd\s*Up[:\s]+([\d\w\s%\-\/]+)/i],
+        ['3rd Up',   /3rd\s*Up[:\s]+([\d\w\s%\-\/]+)/i],
+      ];
+      for (const [key, pat] of conditionKeys) {
+        if (!condStats[key]) {
+          const m = elText.match(pat);
+          if (m) condStats[key] = m[1].trim().slice(0, 30);
+        }
+      }
 
-      return {
-        number, name, jockey, trainer,
-        form:       meta['F'] || '',
-        weight:     meta['W'] || '',
-        rating:     meta['R'] || '',
-        winOdds,
-        placeOdds,
-        toteWin:    prices[2] || '',
-        totePlace:  prices[3] || '',
-        scratched:  (winOdds + ' ' + placeOdds).includes('SCR'),
-      };
-    });
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Form data (expanded panels)
-// ---------------------------------------------------------------------------
-
-async function scrapeFormData(page) {
-  return page.evaluate(() => {
-    const formRows = [...document.querySelectorAll('.row.form')];
-
-    return formRows.map(formRow => {
-      const wrapper = formRow.querySelector('.form-data-wrapper');
-      if (!wrapper) return null;
-
-      // Horse name from preceding sibling runner row
-      let name = 'Unknown';
-      let el = formRow.previousElementSibling;
-      while (el && !el.querySelector('.runner-name')) el = el.previousElementSibling;
-      if (el) name = el.querySelector('.runner-name').textContent.trim();
-
-      // li text helper
-      const liTexts = [...wrapper.querySelectorAll('li')]
-        .map(li => li.textContent.trim()).filter(Boolean);
-      const findVal = key => {
-        const item = liTexts.find(t => t.startsWith(key));
-        return item ? item.slice(key.length).trim() : '';
-      };
-
-      const winsItem   = liTexts.find(t => t.includes('Wins')   && t.includes('%')) || '';
-      const placesItem = liTexts.find(t => t.includes('Places') && t.includes('%')) || '';
-      const winsPct    = (winsItem.match(/(\d+)%/)   || [])[1];
-      const placesPct  = (placesItem.match(/(\d+)%/) || [])[1];
-
-      const profile = {
-        career:     findVal('Career '),
-        prizeMoney: findVal('Prize Money '),
-        sire:       findVal('Sire '),
-        dam:        findVal('Dam '),
-        colour:     findVal('Colour '),
-        sex:        findVal('Sex '),
-        age:        findVal('Age '),
-        trainer:    findVal('Trainer '),
-        jockey:     findVal('Jockey '),
-        owner:      findVal('Owner '),
-        lastRun:    findVal('Last Run '),
-        winsPct:    winsPct   ? winsPct   + '%' : '',
-        placesPct:  placesPct ? placesPct + '%' : '',
-      };
-
-      const conditionStats = {
-        track:    findVal('Track '),
-        distance: findVal('Distance '),
-        trkDist:  findVal('Trk & Dist '),
-        firm:     findVal('Firm '),
-        good:     findVal('Good '),
-        soft:     findVal('Soft '),
-        heavy:    findVal('Heavy '),
-        barrier:  findVal('Barrier '),
-        firstUp:  findVal('1st Up '),
-        secondUp: findVal('2nd Up '),
-        thirdUp:  findVal('3rd Up '),
-      };
-
-      // Race history
+      // ── Race history ──────────────────────────────────────────────────────
       const raceHistory = [];
-      const bodyWrapper = wrapper.querySelector('.flexible-body-wrapper');
-      if (bodyWrapper) {
-        for (const bRow of bodyWrapper.querySelectorAll('.flexible-row')) {
-          const spellEl = bRow.querySelector('.runner-spell .message');
-          if (spellEl) {
-            raceHistory.push({ type: 'spell', message: spellEl.textContent.trim() });
-            continue;
+      const histSelectors = [
+        '[class*="race-history"]',  '[class*="RaceHistory"]',
+        '[class*="last-starts"]',   '[class*="LastStarts"]',
+        '[class*="form-history"]',  '[class*="FormHistory"]',
+        '[class*="run-history"]',   '[class*="RunHistory"]',
+        '[class*="past-starts"]',   '[class*="PastStarts"]',
+        '[class*="race-results"]',  '[class*="RaceResults"]',
+      ];
+
+      let histContainer = null;
+      for (const sel of histSelectors) {
+        histContainer = el.querySelector(sel);
+        if (histContainer) break;
+      }
+
+      if (histContainer) {
+        // Try table rows first
+        const tableRows = histContainer.querySelectorAll('tr:not(:first-child)');
+        if (tableRows.length) {
+          for (const row of tableRows) {
+            const cells = [...row.querySelectorAll('td,th')].map(c => c.textContent.trim());
+            if (cells.length >= 3 && cells.some(c => /\d/.test(c))) {
+              raceHistory.push(parseHistoryRow(cells));
+            }
           }
-          const cells = [...bRow.querySelectorAll('.flexible-cell')].map(c => c.textContent.trim());
-          if (cells.length >= 8 && (cells[0] || cells[2])) {
-            raceHistory.push({
-              type:      'race',
-              placing:   cells[0]  || '',
-              venue:     cells[1]  || '',
-              date:      cells[2]  || '',
-              class:     cells[3]  || '',
-              distance:  cells[4]  || '',
-              weight:    cells[5]  || '',
-              barrier:   cells[6]  || '',
-              odds:      cells[7]  || '',
-              winner2nd: cells[8]  || '',
-              margin:    cells[9]  || '',
-              time:      cells[10] || '',
-              inRun:     cells[11] || '',
-            });
+        } else {
+          // Try generic row elements
+          const rowEls = histContainer.querySelectorAll('[class*="row"],[class*="Row"],[class*="item"],[class*="Item"]');
+          for (const row of rowEls) {
+            const cells = [...row.querySelectorAll('[class*="cell"],[class*="Cell"],[class*="col"],[class*="Col"],span,div')]
+              .filter(c => !c.querySelector('[class*="cell"],[class*="col"],span,div'))
+              .map(c => c.textContent.trim())
+              .filter(Boolean);
+            if (cells.length >= 3) {
+              raceHistory.push(parseHistoryRow(cells));
+            }
           }
         }
       }
 
-      return { name, profile, conditionStats, raceHistory };
-    }).filter(Boolean);
+      // ── Scratched ─────────────────────────────────────────────────────────
+      const scratched = /\bscratched\b|\bSCR\b/.test(elText);
+
+      // ── Age / Sex / Colour ────────────────────────────────────────────────
+      const ageSexColour = getText(el, [
+        '[class*="age-sex"]', '[class*="AgeSex"]',
+        '[class*="horse-details"]','[class*="HorseDetails"]',
+        '[class*="details"]',
+      ]);
+
+      // ── Sire / Dam ────────────────────────────────────────────────────────
+      const sire = getText(el, ['[class*="sire"]','[class*="Sire"]']);
+      const dam  = getText(el, ['[class*="dam"]','[class*="Dam"]']);
+
+      results.push({
+        number:       number.replace(/\D/g, '').slice(0, 2) || '',
+        name:         name.replace(/\s+/g, ' ').trim(),
+        barrier:      barrier.replace(/\D/g, '').slice(0, 2) || '',
+        jockey:       jockey.replace(/\s+/g, ' ').trim(),
+        trainer:      trainer.replace(/\s+/g, ' ').trim(),
+        weight:       weight.replace(/\s+/g, ' ').trim(),
+        form,
+        winOdds,
+        placeOdds,
+        careerStarts,
+        careerWins,
+        careerSeconds,
+        careerThirds,
+        prizeMoney,
+        winPct,
+        placePct,
+        ageSexColour: ageSexColour.replace(/\s+/g, ' ').trim(),
+        sire:         sire.replace(/\s+/g, ' ').trim(),
+        dam:          dam.replace(/\s+/g, ' ').trim(),
+        condStats,
+        raceHistory,
+        scratched,
+      });
+    }
+
+    return results;
+
+    // Inner helper: convert an array of cell strings into a structured race entry
+    function parseHistoryRow(cells) {
+      const row = { raw: cells.join(' | ') };
+
+      for (const cell of cells) {
+        // Date
+        if (!row.date && /\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}/.test(cell))
+          row.date = cell;
+        // Distance
+        if (!row.distance && /^\d{3,4}m$/i.test(cell.trim()))
+          row.distance = cell.trim();
+        // Track condition
+        if (!row.condition && /^(Firm|Good|Soft|Heavy|Synthetic|Wet)\d*$/i.test(cell.trim()))
+          row.condition = cell.trim();
+        // Race class
+        if (!row.raceClass && /^(G[123]|Listed|BM\d+|MDN|Maiden|CL\d+|Open|Hcp|WFA|\d+YO)/i.test(cell.trim()))
+          row.raceClass = cell.trim();
+        // Position (e.g. "1st" "2nd" "1/8")
+        if (!row.position && (/^\d{1,2}(st|nd|rd|th)$/i.test(cell.trim()) || /^\d{1,2}\/\d{1,2}$/.test(cell.trim())))
+          row.position = cell.trim();
+        // Margin
+        if (!row.margin && /^(\d+(\.\d+)?L|SH|NK|HD|NS|NOS|NECK|HEAD)$/i.test(cell.trim()))
+          row.margin = cell.trim();
+        // Time
+        if (!row.time && /^\d:\d{2}\.\d{1,2}$/.test(cell.trim()))
+          row.time = cell.trim();
+        // Weight
+        if (!row.weight && /^\d{2}(\.\d)?$/.test(cell.trim()) && Number(cell) >= 48 && Number(cell) <= 65)
+          row.weight = cell.trim();
+        // Odds / price
+        if (!row.odds && /^\$?[\d]+\.?\d{0,2}$/.test(cell.trim()) && !row.weight)
+          row.odds = cell.trim().replace('$', '');
+      }
+
+      // Venue is often the one string with mixed case letters that isn't a name field
+      for (const cell of cells) {
+        if (!row.venue && /^[A-Z][a-z]+/.test(cell) && cell.length > 2 && cell.length < 25
+            && !row.date && !/[%:]/.test(cell)) {
+          row.venue = cell;
+          break;
+        }
+      }
+
+      return row;
+    }
   });
 }
 
 // ---------------------------------------------------------------------------
-// RacingZone
+// Try to enrich runner data from embedded JSON (Next.js / API response)
 // ---------------------------------------------------------------------------
 
-async function fillInput(page, selector, value) {
-  // Works for plain HTML and React/Vue controlled inputs.
-  // 1) Click to focus, 2) select-all + delete any existing text,
-  // 3) set value via native setter (triggers React's synthetic onChange),
-  // 4) dispatch real browser events so the framework picks up the change,
-  // 5) type the text character-by-character as a fallback belt-and-suspenders.
-  await page.click(selector);
-  await page.keyboard.down('Control');
-  await page.keyboard.press('KeyA');
-  await page.keyboard.up('Control');
-  await page.keyboard.press('Backspace');
-
-  await page.evaluate((sel, val) => {
-    const el = document.querySelector(sel);
-    if (!el) return;
-    // Native setter bypasses React's read-only descriptor
-    const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-    nativeSetter.call(el, val);
-    el.dispatchEvent(new Event('input',  { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-  }, selector, value);
-}
-
-async function scrapeRacingZoneHorse(page, horseName, screenshotDir) {
-  const stats = {
-    name: horseName, error: '',
-    careerStarts: '', careerWins: '', careerSeconds: '', careerThirds: '',
-    careerWinPct: '', careerPlacePct: '', careerPrizeMoney: '',
-    l12mStarts: '', l12mWins: '', l12mSeconds: '', l12mThirds: '',
-    statsByDistance: '', statsByCondition: '', statsByTrackType: '',
-    statsByJockey: '', statsByTrainer: '',
-    raceHistory: [],   // populated from OCR
-  };
-
-  info(`Searching RacingZone for: ${horseName}`);
+function parseEmbeddedRunners(embedded) {
+  if (!embedded) return null;
   try {
-    await page.goto(RACINGZONE_HORSES_URL, { waitUntil: 'networkidle2', timeout: 60000 });
-    info(`  Landed on: ${page.url()}`);
-
-    // Find the search input — first visible match wins
-    const inputSels = [
-      "input[name='horse_name']", "input[name='name']",
-      "#horse_name", "#name",
-      "input[placeholder*='horse' i]", "input[placeholder*='Find' i]",
-      "input[placeholder*='Search' i]", "input[type='search']",
-      "form input[type='text']", "input[type='text']",
-    ];
-
-    let inputSel = null;
-    for (const sel of inputSels) {
-      try {
-        await page.waitForSelector(sel, { visible: true, timeout: 3000 });
-        inputSel = sel;
-        info(`  Search input found: ${sel}`);
-        break;
-      } catch { /* try next */ }
+    // Flatten nested data objects looking for runner arrays
+    const str = JSON.stringify(embedded.data);
+    // Look for arrays that have horse/runner objects
+    const matches = str.match(/"(?:horse|runner|competitor)Name"\s*:\s*"([^"]+)"/g);
+    if (matches && matches.length >= 2) {
+      info(`Embedded data contains ${matches.length} horse/runner name references`);
     }
-
-    // Last resort: find any visible text input dynamically
-    if (!inputSel) {
-      inputSel = await page.evaluate(() => {
-        const el = [...document.querySelectorAll('input')]
-          .find(i => i.offsetParent !== null &&
-                     (i.type === 'text' || i.type === 'search' || i.type === ''));
-        if (!el) return null;
-        if (el.id)   return `#${el.id}`;
-        if (el.name) return `input[name="${el.name}"]`;
-        return 'input[type="text"]';
-      });
-    }
-
-    if (!inputSel) { stats.error = 'Search input not found'; return stats; }
-
-    await fillInput(page, inputSel, horseName);
-    await sleep(500);
-
-    // Verify value landed
-    const actual = await page.$eval(inputSel, el => el.value).catch(() => '');
-    if (!actual) {
-      warn(`  Input still empty — retrying with keyboard`);
-      await page.click(inputSel, { clickCount: 3 });
-      await page.keyboard.press('Backspace');
-      await page.keyboard.type(horseName, { delay: 60 });
-      await sleep(300);
-    }
-    info(`  Input value: "${await page.$eval(inputSel, el => el.value).catch(() => '?')}"`);
-
-    // Submit — wait for either a full navigation or AJAX settling
-    const btnSels = [
-      "button[type='submit']", "input[type='submit']",
-      "button[class*='search' i]", "form button",
-    ];
-    let submitBtn = null;
-    for (const sel of btnSels) {
-      submitBtn = await page.$(sel);
-      if (submitBtn) break;
-    }
-
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
-      submitBtn ? submitBtn.click() : page.keyboard.press('Enter'),
-    ]);
-    await sleep(1500);
-    info(`  After search — URL: ${page.url()}`);
-
-    // If we're on a results list, click the best-matching horse link
-    const afterSearchUrl = page.url();
-    const isOnHorsePage  = /\/horses?\/[^/]+\/?$/.test(afterSearchUrl);
-
-    if (!isOnHorsePage) {
-      // Gather all links visible on the page and find the best name match
-      const allLinks = await page.evaluate((name) => {
-        return [...document.querySelectorAll('a')]
-          .filter(a => a.href && a.textContent.trim())
-          .map(a => ({ text: a.textContent.trim(), href: a.href }));
-      }, horseName);
-
-      const nl = horseName.toLowerCase();
-      const match = allLinks.find(l => l.text.toLowerCase().includes(nl))
-                 || allLinks.find(l => nl.includes(l.text.toLowerCase()) && l.text.length > 3);
-
-      if (match) {
-        info(`  Clicking result: "${match.text}" → ${match.href}`);
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
-          page.goto(match.href, { waitUntil: 'networkidle2', timeout: 30000 }),
-        ]);
-        await sleep(1500);
-      } else {
-        // Log what was found so the user can see
-        info(`  No matching link — links on page: ${allLinks.slice(0, 10).map(l => l.text).join(', ')}`);
-      }
-    }
-
-    info(`  Taking screenshot and running OCR: ${page.url()}`);
-    const ocrText = await screenshotAndOcr(page, horseName, screenshotDir);
-    parseOcrText(ocrText, stats);
-
-  } catch (err) {
-    error(`RacingZone error for ${horseName}:`, err.message);
-    stats.error = err.message.slice(0, 200);
-  }
-  return stats;
+  } catch { /* ignore */ }
+  return null; // DOM scraping is the primary method; embedded is a diagnostic hint
 }
 
 // ---------------------------------------------------------------------------
-// Screenshot → OCR → parse  (replaces DOM scraping for RacingZone)
-// ---------------------------------------------------------------------------
-
-async function screenshotAndOcr(page, horseName, screenshotDir) {
-  fs.mkdirSync(screenshotDir, { recursive: true });
-  const safeName = horseName.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 50);
-  const imgPath  = path.join(screenshotDir, `${safeName}.png`);
-
-  // Scroll to top so the full page starts from the beginning
-  await page.evaluate(() => window.scrollTo(0, 0));
-  await sleep(500);
-
-  await page.screenshot({ path: imgPath, fullPage: true });
-  info(`  Screenshot saved: ${imgPath}`);
-
-  // Run OCR with tesseract.js
-  const worker = await createWorker('eng');
-  try {
-    const { data: { text } } = await worker.recognize(imgPath);
-    info(`  OCR complete: ${text.length} chars extracted`);
-    return text;
-  } finally {
-    await worker.terminate();
-  }
-}
-
-function parseRaceRow(line) {
-  // Accept dd/mm/yy, dd-mm-yy, dd.mm.yy  OR  "15 May 25" / "15 May 2025"
-  const dateMatch =
-    line.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/) ||
-    line.match(/\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]+\d{2,4})\b/i);
-  if (!dateMatch) return null;
-
-  const row = { date: dateMatch[1], raw: line };
-
-  // Distance: 800m – 3200m
-  const dist = line.match(/\b(\d{3,4}m)\b/i);
-  if (dist) row.distance = dist[1];
-
-  // Track condition: Good4, Soft7, Heavy10, Firm, Synthetic
-  const cond = line.match(/\b(Firm\d*|Good\d*|Soft\d*|Heavy\d*|Synthetic|Syn)\b/i);
-  if (cond) row.condition = cond[1];
-
-  // Placing: "1st" / "2nd" / "3rd" / "1/8" (position of X runners)
-  const placeSlash = line.match(/\b(\d{1,2})\/(\d{1,2})\b/);
-  const placeSuffix = line.match(/\b(\d+(?:st|nd|rd|th))\b/i);
-  if (placeSlash)       row.placing = `${placeSlash[1]}/${placeSlash[2]}`;
-  else if (placeSuffix) row.placing = placeSuffix[1];
-
-  // Race time: 1:09.50 or 0:57.30
-  const time = line.match(/\b(\d:\d{2}\.\d{1,2})\b/);
-  if (time) row.time = time[1];
-
-  // Margin: 0.5L, 2.5L, SH, NK, LH, HD, NS
-  const margin = line.match(/\b(\d+(?:\.\d+)?L|(?:SH|NK|LH|HD|NS|NOS|NECK|HEAD))\b/i);
-  if (margin) row.margin = margin[1];
-
-  // Race class: G1 G2 G3, Listed, BM64, MDN, CL1, 2YO, WFA, Open, Hcp
-  const cls = line.match(/\b(G[123]|Gr[123]|Listed|BM\d+|MDN|CL\d+|\d+YO|WFA|Open|Hcp|HCP|FM\d*)\b/i);
-  if (cls) row.class = cls[1];
-
-  // Odds / SP: $3.50 or 3.50 near end of line
-  const odds = line.match(/\$?(\d{1,3}\.\d{1,2})\s*$/);
-  if (odds) row.odds = odds[1];
-
-  // Weight carried: 54.0 kg, 57.5 kg — a decimal number between 48–65 not already captured as odds
-  const weightMatch = line.match(/\b((?:4[89]|5\d|6[0-5])(?:\.\d)?)\b/g) || [];
-  const notOdds = weightMatch.filter(w => row.odds !== w);
-  if (notOdds.length) row.weight = notOdds[0];
-
-  return row;
-}
-
-// Keywords that indicate a race history section on RacingZone (case-insensitive).
-// Deliberately excludes nav-menu phrases like "Form Guide", "Recent Form", "Race Form".
-const HISTORY_HEADINGS = [
-  'race history', 'past runs', 'run history', 'recent runs', 'form history',
-  'last starts', 'race record', 'past performances', 'run record',
-  'recent starts', 'race results', 'last runs', 'past starts', 'last performances',
-];
-
-function parseOcrText(rawText, stats) {
-  const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
-
-  // Log first 300 chars of OCR to help diagnose heading / format issues
-  info(`  OCR preview: ${rawText.slice(0, 300).replace(/\n/g, ' ↵ ')}`);
-
-  // Phase 1 — scan every line for profile fields, career stats, section headings
-  let currentSection = null;
-  let inHistory      = false;
-  const sections = { distance: [], condition: [], jockey: [], trainer: [] };
-
-  for (const line of lines) {
-    const lower = line.toLowerCase();
-
-    // ── Detect race history section start ────────────────────────────────────
-    // Guard: line must be short (≤40 chars) so nav-bar sentences don't match.
-    if (!inHistory && line.length <= 40 && HISTORY_HEADINGS.some(h => lower.includes(h))) {
-      inHistory = true;
-      currentSection = null;
-      info(`  Race history section detected on line: "${line}"`);
-      continue;
-    }
-
-    // ── Inside race history — collect rows then stop at next major section ───
-    if (inHistory) {
-      if (lower.match(/^(stats by|by distance|by condition|by track|by jockey|by trainer|career record)\b/)) {
-        inHistory = false;
-        // fall through to section-heading handling below
-      } else {
-        const row = parseRaceRow(line);
-        if (row) stats.raceHistory.push(row);
-        continue;
-      }
-    }
-
-    // ── Key: Value pairs (Sire, Dam, Colour, etc.) ──────────────────────────
-    const kv = line.match(/^([A-Za-z][\w &/]+?):\s*(.+)$/);
-    if (kv) {
-      const key = kv[1].toLowerCase().trim();
-      const val = kv[2].trim();
-      if (key.includes('sire'))                         stats.sire    = stats.sire    || val;
-      if (key.includes('dam'))                          stats.dam     = stats.dam     || val;
-      if (key.includes('colour') || key === 'color')    stats.colour  = stats.colour  || val;
-      if (key === 'sex' || key === 'gender')            stats.sex     = stats.sex     || val;
-      if (key === 'age')                                stats.age     = stats.age     || val;
-      if (key.includes('trainer'))                      stats.trainer = stats.trainer || val;
-      if (key.includes('owner'))                        stats.owner   = stats.owner   || val;
-      if (key.includes('breeder'))                      stats.breeder = stats.breeder || val;
-      if (key.includes('country') || key === 'origin')  stats.country = stats.country || val;
-    }
-
-    // ── Career stats row ─────────────────────────────────────────────────────
-    if (lower.includes('career') && !lower.includes('prize')) {
-      const nums  = line.match(/\d[\d,]*/g) || [];
-      const prize = line.match(/\$[\d,]+/);
-      if (nums.length >= 4) {
-        if (!stats.careerStarts)  stats.careerStarts  = nums[0];
-        if (!stats.careerWins)    stats.careerWins    = nums[1];
-        if (!stats.careerSeconds) stats.careerSeconds = nums[2];
-        if (!stats.careerThirds)  stats.careerThirds  = nums[3];
-      }
-      if (prize && !stats.careerPrizeMoney) stats.careerPrizeMoney = prize[0];
-    }
-
-    // ── Last 12 months row ──────────────────────────────────────────────────
-    if ((lower.includes('last 12') || lower.includes('l12') || lower.includes('12 month')) && !stats.l12mStarts) {
-      const nums = line.match(/\d[\d,]*/g) || [];
-      if (nums.length >= 4) {
-        stats.l12mStarts  = nums[0];
-        stats.l12mWins    = nums[1];
-        stats.l12mSeconds = nums[2];
-        stats.l12mThirds  = nums[3];
-      }
-    }
-
-    // ── Win % / Place % ─────────────────────────────────────────────────────
-    const winPctMatch   = line.match(/win[s]?\s*[:%]\s*([\d.]+\s*%?)/i);
-    const placePctMatch = line.match(/place[s]?\s*[:%]\s*([\d.]+\s*%?)/i);
-    if (winPctMatch   && !stats.careerWinPct)   stats.careerWinPct   = winPctMatch[1].trim();
-    if (placePctMatch && !stats.careerPlacePct) stats.careerPlacePct = placePctMatch[1].trim();
-
-    // ── Stats-by-X section headings ──────────────────────────────────────────
-    if      (lower.includes('by distance') || (lower.includes('distance') && lower.length < 25))  currentSection = 'distance';
-    else if (lower.includes('by condition') || (lower.includes('condition') && lower.length < 25)) currentSection = 'condition';
-    else if (lower.includes('by jockey')   || (lower.includes('jockey')   && lower.length < 25))  currentSection = 'jockey';
-    else if (lower.includes('by trainer')  || (lower.includes('trainer')  && lower.length < 25))  currentSection = 'trainer';
-    else if (currentSection) {
-      if (line.length < 30 && /^[A-Z]/.test(line) && !/\d/.test(line)) {
-        currentSection = null;
-      } else {
-        sections[currentSection].push(line);
-      }
-    }
-  }
-
-  if (sections.distance.length)  stats.statsByDistance  = sections.distance.join('\n');
-  if (sections.condition.length) stats.statsByCondition = sections.condition.join('\n');
-  if (sections.jockey.length)    stats.statsByJockey    = sections.jockey.join('\n');
-  if (sections.trainer.length)   stats.statsByTrainer   = sections.trainer.join('\n');
-
-  // Fallback: no section heading was detected — scan every line for anything
-  // that looks like a race row (date + at least one other racing field).
-  if (stats.raceHistory.length === 0) {
-    info(`  No race history heading found — running fallback line scan`);
-    for (const line of lines) {
-      const row = parseRaceRow(line);
-      if (row && (row.distance || row.condition || row.class || row.placing || row.time)) {
-        stats.raceHistory.push(row);
-      }
-    }
-    if (stats.raceHistory.length > 0)
-      info(`  Fallback scan found ${stats.raceHistory.length} race rows`);
-  }
-
-  info(`  Parsed — career: ${stats.careerStarts}/${stats.careerWins}/${stats.careerSeconds}/${stats.careerThirds} | sire: ${stats.sire || '–'} | history rows: ${stats.raceHistory.length}`);
-}
-
-// ---------------------------------------------------------------------------
-// Excel colours / style helpers  (matches greyhoundracing/index.js palette)
+// Excel colours / style helpers
 // ---------------------------------------------------------------------------
 
 const HEADER_BG  = 'FF1B5E20';
 const SECTION_BG = 'FF388E3C';
 const ALT_BG     = 'FFE8F5E9';
-const SPELL_BG   = 'FFFFE699';
-const SPELL_FG   = 'FF7F4F00';
 const WHITE      = 'FFFFFFFF';
 const GREY_TEXT  = 'FF999999';
 
@@ -719,16 +665,6 @@ function styleData(row, numCols, alternate = false) {
   }
 }
 
-function styleSpell(row, numCols) {
-  for (let c = 1; c <= numCols; c++) {
-    const cell = row.getCell(c);
-    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: SPELL_BG } };
-    cell.font      = { color: { argb: SPELL_FG }, bold: true, italic: true };
-    cell.alignment = { horizontal: 'center', vertical: 'middle' };
-    cell.border    = thinBorder;
-  }
-}
-
 function autoWidth(ws, min = 8, max = 40) {
   ws.columns.forEach(col => {
     let maxLen = 0;
@@ -744,199 +680,129 @@ function autoWidth(ws, min = 8, max = 40) {
 // Excel export
 // ---------------------------------------------------------------------------
 
-async function saveToExcel(raceInfo, runners, formData, horseStats, outputPath) {
+async function saveToExcel(raceInfo, runners, outputPath) {
   fs.mkdirSync(outputPath, { recursive: true });
 
-  const safeVenue = (raceInfo.venue || 'Unknown').replace(/[^a-zA-Z0-9 _-]/g, '_');
-  const dateStr   = (raceInfo.date  || new Date().toISOString().slice(0, 10)).replace(/-/g, '');
-  const filename  = `TAB_${safeVenue}_R${raceInfo.raceNum || '0'}_${dateStr}.xlsx`.replace(/\s+/g, '_');
+  const safeVenue = (raceInfo.raceName || 'Ladbrokes').replace(/[^a-zA-Z0-9 _-]/g, '_').replace(/\s+/g, '_');
+  const dateStr   = (raceInfo.date || new Date().toISOString().slice(0, 10)).replace(/[\s\/\-]/g, '');
+  const raceTag   = raceInfo.raceNum ? `_R${raceInfo.raceNum}` : '';
+  const filename  = `Ladbrokes_${safeVenue}${raceTag}_${dateStr}.xlsx`;
   const filepath  = path.join(outputPath, filename);
 
   info('Saving Excel:', filepath);
   const wb = new ExcelJS.Workbook();
 
-  const stripNum = name => name.replace(/\s*\(\d+\)\s*$/, '').trim();
-
   // ── Sheet 1: Race Info ──────────────────────────────────────────────────
-  const ws1 = wb.addWorksheet('Race Info');
-  ws1.views = [{ state: 'frozen', ySplit: 1, xSplit: 1 }];
-  ws1.columns = [{ width: 20 }, { width: 50 }];
-  styleHeader(ws1.addRow(['Field', 'Value']), 2);
-  [
-    ['Race Name',       raceInfo.raceName       || ''],
-    ['Date',            raceInfo.date           || ''],
-    ['Venue',           raceInfo.venue          || ''],
-    ['Race Number',     raceInfo.raceNum        || ''],
-    ['Track Condition', raceInfo.trackCondition || ''],
-    ['Banner Details',  raceInfo.bannerDetails  || ''],
-    ['URL',             raceInfo.url            || ''],
-    ['Scraped At',      new Date().toISOString().replace('T', ' ').slice(0, 19)],
-  ].forEach(([k, v], i) => styleData(ws1.addRow([k, v]), 2, i % 2 === 1));
+  {
+    const ws = wb.addWorksheet('Race Info');
+    ws.columns = [{ width: 22 }, { width: 55 }];
+    styleHeader(ws.addRow(['Field', 'Value']), 2);
+    [
+      ['Race Name / Venue',  raceInfo.raceName       || ''],
+      ['Date',               raceInfo.date           || ''],
+      ['Race Number',        raceInfo.raceNum        || ''],
+      ['Distance',           raceInfo.distance       || ''],
+      ['Class',              raceInfo.raceClass      || ''],
+      ['Track Condition',    raceInfo.trackCondition || ''],
+      ['Details',            raceInfo.details        || ''],
+      ['URL',                raceInfo.url            || ''],
+      ['Scraped At',         new Date().toISOString().replace('T', ' ').slice(0, 19)],
+    ].forEach(([k, v], i) => styleData(ws.addRow([k, v]), 2, i % 2 === 1));
+  }
 
   // ── Sheet 2: Runners ───────────────────────────────────────────────────
-  const ws2 = wb.addWorksheet('Runners (TAB)');
-  ws2.views = [{ state: 'frozen', ySplit: 1 }];
-  const runnerCols = [
-    'No.', 'Horse', 'Jockey', 'Trainer', 'Form', 'Weight', 'Rating',
-    'FO Win', 'FO Place', 'Tote Win', 'Tote Place', 'Scratched',
-  ];
-  styleHeader(ws2.addRow(runnerCols), runnerCols.length);
-  runners.forEach((r, i) => {
-    const row = ws2.addRow([
-      r.number, r.name, r.jockey, r.trainer, r.form, r.weight, r.rating,
-      r.winOdds, r.placeOdds, r.toteWin, r.totePlace,
-      r.scratched ? 'Yes' : 'No',
-    ]);
-    styleData(row, runnerCols.length, i % 2 === 1);
-    if (r.scratched) {
-      for (let c = 1; c <= runnerCols.length; c++)
-        row.getCell(c).font = { color: { argb: GREY_TEXT }, italic: true };
-    }
-  });
-  autoWidth(ws2);
+  {
+    const ws = wb.addWorksheet('Runners');
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+    const cols = ['No.', 'Horse', 'Barrier', 'Jockey', 'Trainer', 'Weight', 'Form', 'Win Odds', 'Place Odds', 'Age/Sex/Colour', 'Sire', 'Dam', 'Scratched'];
+    styleHeader(ws.addRow(cols), cols.length);
+    runners.forEach((r, i) => {
+      const row = ws.addRow([
+        r.number, r.name, r.barrier, r.jockey, r.trainer, r.weight, r.form,
+        r.winOdds, r.placeOdds, r.ageSexColour, r.sire, r.dam,
+        r.scratched ? 'Yes' : 'No',
+      ]);
+      styleData(row, cols.length, i % 2 === 1);
+      if (r.scratched) {
+        for (let c = 1; c <= cols.length; c++)
+          row.getCell(c).font = { color: { argb: GREY_TEXT }, italic: true };
+      }
+    });
+    autoWidth(ws);
+  }
 
-  // ── Sheet 3: Horse Profiles ────────────────────────────────────────────
-  const ws3 = wb.addWorksheet('Horse Profiles');
-  ws3.views = [{ state: 'frozen', ySplit: 1 }];
-  const profCols = [
-    'No.', 'Horse', 'Career', 'Prize Money', 'Sire', 'Dam',
-    'Colour', 'Sex', 'Age', 'Owner', 'Trainer', 'Jockey',
-    'Last Run', 'Wins %', 'Places %',
-  ];
-  styleHeader(ws3.addRow(profCols), profCols.length);
-  const runnerMap = new Map(runners.map(r => [r.name.toUpperCase(), r]));
-  formData.forEach((fd, i) => {
-    const clean   = stripNum(fd.name);
-    const runner  = runnerMap.get(clean.toUpperCase()) || {};
-    const p       = fd.profile;
-    const row = ws3.addRow([
-      runner.number || '', clean,
-      p.career, p.prizeMoney, p.sire, p.dam, p.colour, p.sex, p.age,
-      p.owner, p.trainer || runner.trainer, p.jockey || runner.jockey,
-      p.lastRun, p.winsPct, p.placesPct,
-    ]);
-    styleData(row, profCols.length, i % 2 === 1);
-  });
-  autoWidth(ws3);
+  // ── Sheet 3: Career Stats ──────────────────────────────────────────────
+  {
+    const ws = wb.addWorksheet('Career Stats');
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+    const cols = ['No.', 'Horse', 'Starts', 'Wins', '2nds', '3rds', 'Prize Money', 'Win %', 'Place %'];
+    styleHeader(ws.addRow(cols), cols.length);
+    runners.forEach((r, i) => {
+      styleData(ws.addRow([
+        r.number, r.name,
+        r.careerStarts, r.careerWins, r.careerSeconds, r.careerThirds,
+        r.prizeMoney, r.winPct, r.placePct,
+      ]), cols.length, i % 2 === 1);
+    });
+    autoWidth(ws);
+  }
 
   // ── Sheet 4: Condition Stats ───────────────────────────────────────────
-  const ws4 = wb.addWorksheet('Condition Stats');
-  ws4.views = [{ state: 'frozen', ySplit: 1 }];
-  const condCols = [
-    'No.', 'Horse', 'Track', 'Distance', 'Trk & Dist',
-    'Firm', 'Good', 'Soft', 'Heavy', 'Barrier', '1st Up', '2nd Up', '3rd Up',
-  ];
-  styleHeader(ws4.addRow(condCols), condCols.length);
-  formData.forEach((fd, i) => {
-    const clean  = stripNum(fd.name);
-    const runner = runnerMap.get(clean.toUpperCase()) || {};
-    const cs     = fd.conditionStats;
-    styleData(ws4.addRow([
-      runner.number || '', clean,
-      cs.track, cs.distance, cs.trkDist,
-      cs.firm, cs.good, cs.soft, cs.heavy,
-      cs.barrier, cs.firstUp, cs.secondUp, cs.thirdUp,
-    ]), condCols.length, i % 2 === 1);
-  });
-  autoWidth(ws4);
+  {
+    const ws = wb.addWorksheet('Condition Stats');
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+    // Collect all condition stat keys used across all runners
+    const allKeys = new Set();
+    for (const r of runners) Object.keys(r.condStats || {}).forEach(k => allKeys.add(k));
+    const keyList = [...allKeys];
+    const cols = ['No.', 'Horse', ...keyList];
+    styleHeader(ws.addRow(cols), cols.length);
+    runners.forEach((r, i) => {
+      styleData(ws.addRow([
+        r.number, r.name,
+        ...keyList.map(k => (r.condStats || {})[k] || ''),
+      ]), cols.length, i % 2 === 1);
+    });
+    autoWidth(ws);
+  }
 
   // ── Sheet 5: Race History ──────────────────────────────────────────────
-  const ws5 = wb.addWorksheet('Race History');
-  ws5.views = [{ state: 'frozen', ySplit: 1, xSplit: 2 }];
-  const histCols = [
-    'No.', 'Horse', 'Placing', 'Venue', 'Date', 'Class',
-    'Dist', 'Weight', 'Barrier', 'Odds', 'Winner/2nd',
-    'Margin', 'Time', 'In Run',
-  ];
-  styleHeader(ws5.addRow(histCols), histCols.length);
+  {
+    const ws = wb.addWorksheet('Race History');
+    ws.views = [{ state: 'frozen', ySplit: 1, xSplit: 2 }];
+    const cols = ['No.', 'Horse', 'Date', 'Venue', 'Distance', 'Condition', 'Class', 'Position', 'Margin', 'Time', 'Weight', 'Odds', 'Raw'];
+    styleHeader(ws.addRow(cols), cols.length);
 
-  let curRow = 2;
-  for (const fd of formData) {
-    const clean  = stripNum(fd.name);
-    const runner = runnerMap.get(clean.toUpperCase()) || {};
-    const num    = runner.number || '';
+    let sheetRow = 2;
+    for (const r of runners) {
+      if (!r.raceHistory || !r.raceHistory.length) continue;
 
-    const secRow = ws5.addRow([num, clean, ...Array(histCols.length - 2).fill('')]);
-    styleSection(secRow, histCols.length);
-    curRow++;
+      const sec = ws.addRow([r.number, r.name, ...Array(cols.length - 2).fill('')]);
+      styleSection(sec, cols.length);
+      sheetRow++;
 
-    let alt = false;
-    for (const entry of fd.raceHistory) {
-      if (entry.type === 'spell') {
-        const r = ws5.addRow([entry.message]);
-        ws5.mergeCells(curRow, 1, curRow, histCols.length);
-        styleSpell(r, histCols.length);
-        alt = false;
-      } else {
-        const r = ws5.addRow([
-          num, clean, entry.placing, entry.venue, entry.date, entry.class,
-          entry.distance, entry.weight, entry.barrier, entry.odds,
-          entry.winner2nd, entry.margin, entry.time, entry.inRun,
-        ]);
-        styleData(r, histCols.length, alt);
+      let alt = false;
+      for (const entry of r.raceHistory) {
+        styleData(ws.addRow([
+          r.number, r.name,
+          entry.date      || '',
+          entry.venue     || '',
+          entry.distance  || '',
+          entry.condition || '',
+          entry.raceClass || '',
+          entry.position  || '',
+          entry.margin    || '',
+          entry.time      || '',
+          entry.weight    || '',
+          entry.odds      || '',
+          entry.raw       || '',
+        ]), cols.length, alt);
         alt = !alt;
+        sheetRow++;
       }
-      curRow++;
     }
+    autoWidth(ws);
   }
-  autoWidth(ws5);
-
-  // ── Sheet 6: RacingZone Stats ──────────────────────────────────────────
-  const ws6 = wb.addWorksheet('RacingZone Stats');
-  ws6.views = [{ state: 'frozen', ySplit: 1 }];
-  const rzCols = [
-    'Horse', 'Career Starts', 'Career Wins', 'Career 2nds', 'Career 3rds',
-    'Career Win %', 'Career Place %', 'Career Prize $',
-    'L12M Starts', 'L12M Wins', 'L12M 2nds', 'L12M 3rds',
-    'By Distance', 'By Condition', 'By Track Type', 'By Jockey', 'By Trainer', 'Error',
-  ];
-  styleHeader(ws6.addRow(rzCols), rzCols.length);
-  horseStats.forEach((s, i) => {
-    styleData(ws6.addRow([
-      s.name, s.careerStarts, s.careerWins, s.careerSeconds, s.careerThirds,
-      s.careerWinPct, s.careerPlacePct, s.careerPrizeMoney,
-      s.l12mStarts, s.l12mWins, s.l12mSeconds, s.l12mThirds,
-      s.statsByDistance, s.statsByCondition, s.statsByTrackType,
-      s.statsByJockey, s.statsByTrainer, s.error,
-    ]), rzCols.length, i % 2 === 1);
-  });
-  autoWidth(ws6);
-
-  // ── Sheet 7: RZ Race History ───────────────────────────────────────────
-  const ws7 = wb.addWorksheet('RZ Race History');
-  ws7.views = [{ state: 'frozen', ySplit: 1, xSplit: 1 }];
-  const rzHistCols = [
-    'Horse', 'Date', 'Distance', 'Condition', 'Class',
-    'Placing', 'Time', 'Margin', 'Weight', 'Odds', 'Raw Line',
-  ];
-  styleHeader(ws7.addRow(rzHistCols), rzHistCols.length);
-
-  for (const s of horseStats) {
-    if (!s.raceHistory || !s.raceHistory.length) continue;
-
-    const secRow = ws7.addRow([s.name, ...Array(rzHistCols.length - 1).fill('')]);
-    styleSection(secRow, rzHistCols.length);
-
-    let alt = false;
-    for (const entry of s.raceHistory) {
-      const r = ws7.addRow([
-        s.name,
-        entry.date      || '',
-        entry.distance  || '',
-        entry.condition || '',
-        entry.class     || '',
-        entry.placing   || '',
-        entry.time      || '',
-        entry.margin    || '',
-        entry.weight    || '',
-        entry.odds      || '',
-        entry.raw       || '',
-      ]);
-      styleData(r, rzHistCols.length, alt);
-      alt = !alt;
-    }
-  }
-  autoWidth(ws7);
 
   await wb.xlsx.writeFile(filepath);
   info('Excel saved:', filepath);
@@ -955,65 +821,58 @@ async function main() {
   info('Launching Chrome...');
   const browser = await puppeteer.launch({
     headless: false,
-    defaultViewport: null,          // use real window size
+    defaultViewport: null,
     args: ['--start-maximized'],
   });
 
   try {
-    // Reuse the tab Chrome already opened (same as greyhoundracing/index.js)
     const [page] = await browser.pages();
 
     info('Navigating to:', url);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
-    info('Waiting for runners...');
-    await waitForRunners(page);
+    info('Dismissing overlays...');
+    await dismissOverlays(page);
+
+    info('Waiting for runner content...');
+    await waitForContent(page);
     await sleep(2000);
 
-    // Dismiss cookie banner
-    try {
-      const cookieBtn = await page.$("[class*='cookie'] button, [id*='cookie'] button");
-      if (cookieBtn) { await cookieBtn.click(); await sleep(1000); info('Cookie banner dismissed.'); }
-    } catch { /* ignore */ }
+    info('Scrolling page to trigger lazy loading...');
+    await scrollPage(page);
 
-    info('Clicking "Show All Form"...');
-    await clickShowAllForm(page);
-    await sleep(3000);
+    // Check for embedded JSON data (diagnostic)
+    const embedded = await tryExtractEmbeddedData(page);
+    if (embedded) {
+      info(`Embedded data found (source: ${embedded.source})`);
+      parseEmbeddedRunners(embedded);
+    }
 
-    info('Scraping race info...');
-    const raceInfo = await getRaceInfo(page);
-    info(`Race: ${raceInfo.raceName || 'Unknown'} | ${raceInfo.date || ''} | ${raceInfo.venue || ''} | R${raceInfo.raceNum || ''}`);
+    info('Extracting race info...');
+    const raceInfo = await getRaceInfo(page, url);
+    info(`Race: ${raceInfo.raceName || 'Unknown'} | Date: ${raceInfo.date || 'N/A'} | Dist: ${raceInfo.distance || 'N/A'} | Cond: ${raceInfo.trackCondition || 'N/A'}`);
 
     info('Scraping runners...');
-    const runners   = await scrapeRunners(page);
-    const active    = runners.filter(r => !r.scratched);
-    const scratched = runners.filter(r => r.scratched);
-    info(`Runners: ${runners.length} total (${active.length} active, ${scratched.length} scratched)`);
+    const runners = await scrapeRunners(page);
+    info(`Found ${runners.length} runner(s)`);
 
     if (!runners.length) {
-      error('No runners found. Check the URL and try again. Page title:', await page.title());
+      error('No runners found. The page may require login or use an unsupported layout.');
+      error('Page title:', await page.title());
+      info('Taking a diagnostic screenshot...');
+      const diagPath = path.join(resolveOutputPath(args.output), 'diagnostic.png');
+      fs.mkdirSync(path.dirname(diagPath), { recursive: true });
+      await page.screenshot({ path: diagPath, fullPage: true });
+      info('Screenshot saved to:', diagPath);
       process.exit(1);
     }
 
-    info('Scraping form data...');
-    const formData = await scrapeFormData(page);
-    info(`Form data scraped for ${formData.length} horses`);
+    const active    = runners.filter(r => !r.scratched);
+    const scratched = runners.filter(r => r.scratched);
+    info(`Runners: ${runners.length} total (${active.length} active, ${scratched.length} scratched)`);
+    runners.forEach(r => info(`  #${r.number || '?'} ${r.name} | J: ${r.jockey || '–'} | T: ${r.trainer || '–'} | Win: ${r.winOdds || '–'} | Form: ${r.form || '–'}`));
 
-    info('Starting RacingZone lookups (screenshot + OCR)...');
-    const screenshotDir = path.join(outputPath, 'screenshots');
-    const horseStats = [];
-    for (let i = 0; i < runners.length; i++) {
-      const runner = runners[i];
-      if (runner.scratched) {
-        horseStats.push({ name: runner.name, error: 'Scratched' });
-        continue;
-      }
-      info(`[${i + 1}/${runners.length}] RacingZone: ${runner.name}`);
-      horseStats.push(await scrapeRacingZoneHorse(page, runner.name, screenshotDir));
-      if (i < runners.length - 1) await sleep(args.delayMs);
-    }
-
-    const outputFile = await saveToExcel(raceInfo, runners, formData, horseStats, outputPath);
+    const outputFile = await saveToExcel(raceInfo, runners, outputPath);
     console.log(`\nDone! Excel file saved to: ${outputFile}`);
 
   } finally {
